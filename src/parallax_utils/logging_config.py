@@ -4,12 +4,14 @@ import logging
 import os
 import sys
 import threading
+from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 __all__ = ["get_logger", "use_parallax_log_handler", "set_log_level"]
 
 _init_lock = threading.Lock()
 _default_handler: logging.Handler | None = None
+_file_handler: logging.Handler | None = None
 
 
 class _Ansi:
@@ -53,6 +55,17 @@ class CustomFormatter(logging.Formatter):
         record.packagecolor = _PACKAGE_COLOR.get(record.package, "")
         return super().format(record)
 
+class FileFormatter(logging.Formatter):
+    """Formatter for file logs without ANSI colors."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        # caller_block: last path component + line no
+        pathname = record.pathname.rsplit("/", 1)[-1]
+        record.caller_block = f"{pathname}:{record.lineno}"
+        record.package = record.name.split(".")[0]
+        # Set empty strings for color fields to reuse the format string if needed
+        # or just use a simpler format
+        return super().format(record)
 
 def _enable_default_handler(target_module_prefix):
     """Attach the default handler to the root logger with a name-prefix filter.
@@ -80,9 +93,18 @@ def _enable_default_handler(target_module_prefix):
     _default_handler.addFilter(_ModuleFilter(target_module_prefix))
     root.addHandler(_default_handler)
 
+    module_filter = _ModuleFilter(target_module_prefix)
+    
+    if _default_handler:
+        _default_handler.addFilter(module_filter)
+        root.addHandler(_default_handler)
+        
+    if _file_handler:
+        _file_handler.addFilter(module_filter)
+        root.addHandler(_file_handler)
 
 def _initialize_if_necessary():
-    global _default_handler
+    global _default_handler, _file_handler
 
     with _init_lock:
         if _default_handler is not None:
@@ -98,6 +120,28 @@ def _initialize_if_necessary():
         _default_handler = logging.StreamHandler(stream=sys.stdout)
         _default_handler.setFormatter(formatter)
 
+        
+        # Initialize file handler
+        try:
+            log_dir = "logs"
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, "parallax.log")
+            
+            # 10MB per file, keep last 5 files
+            _file_handler = RotatingFileHandler(
+                log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
+            )
+            
+            file_fmt = (
+                "{asctime}.{msecs:03.0f} "
+                "[{package:<10}] "
+                "[{levelname:<8}] "
+                "{caller_block:<25} {message}"
+            )
+            file_formatter = FileFormatter(fmt=file_fmt, style="{", datefmt="%Y-%m-%d %H:%M:%S")
+            _file_handler.setFormatter(file_formatter)
+        except Exception as e:
+            sys.stderr.write(f"Failed to initialize file logging: {e}\n")
         # root level from env or INFO
         logging.getLogger().setLevel("INFO")
 
@@ -109,8 +153,8 @@ def set_log_level(level_name: str):
     """Set the root logger level."""
     _initialize_if_necessary()
     logging.getLogger().setLevel(level_name.upper())
-    if level_name.upper() == "DEBUG":
-        os.environ["RUST_LOG"] = "info"
+    #if level_name.upper() == "DEBUG":
+    os.environ["RUST_LOG"] = "info"
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:
@@ -137,3 +181,5 @@ def use_parallax_log_handler(for_root: bool = True):
     root = logging.getLogger()
     if _default_handler not in root.handlers:
         root.addHandler(_default_handler)
+    if _file_handler and _file_handler not in root.handlers:
+        root.addHandler(_file_handler)
