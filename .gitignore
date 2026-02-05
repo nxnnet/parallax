@@ -12,3 +12,7 @@ build/
 .cache
 .vscode/
 hosts.json
+.venv/
+.venvlinux/
+.github/
+.tests/
