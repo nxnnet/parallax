@@ -184,7 +184,9 @@ class MLXModelLoader:
                     f"Adapter path {adapter_path} not found locally. Attempting to download from Hugging Face..."
                 )
                 downloaded_path = snapshot_download(
-                    repo_id=str(adapter_path), local_dir=str(adapter_path)
+                    repo_id=str(adapter_path), 
+                    endpoint="https://hf-mirror.com",
+                    local_dir=str(adapter_path)
                 )
                 adapter_path = pathlib.Path(downloaded_path)
                 logger.info(f"Downloaded adapter to {adapter_path}")

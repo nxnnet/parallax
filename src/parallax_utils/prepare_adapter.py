@@ -23,7 +23,11 @@ def process_adapter_config(model_id):
         print(f"Downloading model from Hugging Face: {model_id} -> {local_dir}")
         try:
             snapshot_download(
-                repo_id=model_id, local_dir=local_dir, local_dir_use_symlinks=False, revision="main"
+                repo_id=model_id, 
+                local_dir=local_dir, 
+                local_dir_use_symlinks=False, 
+                endpoint="https://hf-mirror.com",
+                revision="main"
             )
             print(f"Model downloaded to: {local_dir}")
         except Exception as e:
@@ -105,6 +109,7 @@ def fetch_from_hub(path_or_hf_repo: str):
         model_path = Path(
             snapshot_download(
                 repo_id=path_or_hf_repo,
+                endpoint="https://hf-mirror.com",
                 allow_patterns=["*.json", "*.safetensors", "tokenizer.model"],
             )
         )

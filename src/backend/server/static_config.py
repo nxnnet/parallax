@@ -108,7 +108,10 @@ def get_model_info(model_name, use_hfcache: bool = False):
         from huggingface_hub import hf_hub_download  # type: ignore
 
         config_file = hf_hub_download(
-            repo_id=name, filename="config.json", local_files_only=use_hfcache
+            repo_id=name, 
+            filename="config.json", 
+            endpoint="https://hf-mirror.com",
+            local_files_only=use_hfcache
         )
         with open(config_file, "r") as f:
             return json.load(f)

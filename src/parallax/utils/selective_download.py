@@ -65,6 +65,7 @@ def download_metadata_only(
         cache_dir=cache_dir,
         ignore_patterns=EXCLUDE_WEIGHT_PATTERNS,
         force_download=force_download,
+        endpoint="https://hf-mirror.com",
         local_files_only=local_files_only,
     )
     return Path(path)
@@ -111,6 +112,7 @@ def selective_model_download(
                     repo_id=repo_id,
                     cache_dir=cache_dir,
                     force_download=force_download,
+                    endpoint="https://hf-mirror.com",
                     local_files_only=local_files_only,
                 )
             else:
@@ -133,6 +135,7 @@ def selective_model_download(
                             filename=weight_file,
                             cache_dir=cache_dir,
                             force_download=force_download,
+                            endpoint="https://hf-mirror.com",
                             local_files_only=local_files_only,
                         )
                     except Exception as e:
@@ -155,6 +158,7 @@ def selective_model_download(
                 repo_id=repo_id,
                 cache_dir=cache_dir,
                 force_download=force_download,
+                endpoint="https://hf-mirror.com",
                 local_files_only=local_files_only,
             )
         else:
