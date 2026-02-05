@@ -356,6 +356,7 @@ class GradientServer:
         param_mem_ratio: float = 0.65,
         kvcache_mem_ratio: float = 0.25,
         conn: Any = None,
+        key_path: str = ".",
     ):
         self.recv_from_peer_addr = recv_from_peer_addr
         self.send_to_peer_addr = send_to_peer_addr
@@ -394,6 +395,7 @@ class GradientServer:
         self.status = ServerState.JOINING
         self.manual_layer_assignment = block_end_index is not None and block_start_index is not None
         self.conn = conn
+        self.key_path = key_path
 
         self.scheduler_stub = None
         self.scheduler_peer_id = None
@@ -434,7 +436,7 @@ class GradientServer:
                 logger.warning(f"Folder '{weight_dir}' does not exist.")
 
     def build_lattica(self):
-        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs)
+        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs).with_key_path(self.key_path)
 
         if self.scheduler_addr is not None and self.scheduler_addr != "auto":
             if self.scheduler_addr.startswith("/"):
@@ -988,6 +990,7 @@ def _run_p2p_server_process(
     shared_state: Optional[dict] = None,
     log_level: str = "INFO",
     conn: Any = None,
+    key_path: str = ".",
 ):
     """Run P2P server in subprocess"""
     # Set log level in subprocess (spawn mode doesn't inherit log configuration)
@@ -1019,6 +1022,7 @@ def _run_p2p_server_process(
             param_mem_ratio=param_mem_ratio,
             kvcache_mem_ratio=kvcache_mem_ratio,
             conn=conn,
+            key_path=key_path,
         )
         # Attach shared state to server for syncing layer allocation
         if shared_state is not None:
@@ -1070,6 +1074,7 @@ def launch_p2p_server_process(
     shared_state: Optional[dict] = None,
     log_level: str = "INFO",
     conn: Optional[Any] = None,
+    key_path: str = ".",
 ) -> multiprocessing.Process:
     """Launch P2P server as a subprocess and return the process object
 
@@ -1105,6 +1110,7 @@ def launch_p2p_server_process(
             shared_state,
             log_level,
             conn,
+            key_path,
         ),
     )
     process.start()

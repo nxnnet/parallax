@@ -35,6 +35,7 @@ class SchedulerManage:
         use_hfcache: bool = False,
         enable_weight_refit: bool = False,
         weight_refit_mode: str = "disk",
+        key_path: str = ".",
     ):
         """Initialize the manager with networking bootstrap parameters."""
         self.initial_peers = initial_peers
@@ -46,6 +47,7 @@ class SchedulerManage:
         self.use_hfcache = use_hfcache
         self.enable_weight_refit = enable_weight_refit
         self.weight_refit_mode = weight_refit_mode
+        self.key_path = key_path
         self.model_name = None
         self.init_nodes_num = None
         self.scheduler = None
@@ -226,7 +228,7 @@ class SchedulerManage:
         logger.debug(
             f"Starting Lattica with host_maddrs={self.host_maddrs}, mdns=False, dht_prefix={self.dht_prefix}"
         )
-        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs).with_key_path(".")
+        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs).with_key_path(self.key_path)
 
         if len(self.relay_servers) > 0:
             logger.info(f"Using relay servers: {self.relay_servers}")

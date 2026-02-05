@@ -89,9 +89,10 @@ class NodeChatHttpServer:
         self.scheduler_peer_id = None
         self.scheduler_stub = None
         self.lattica = None
+        self.key_path = args.key_path
 
     def build_lattica(self):
-        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs)
+        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs).with_key_path(self.key_path)
 
         if self.scheduler_addr is not None and self.scheduler_addr != "auto":
             if self.scheduler_addr.startswith("/"):

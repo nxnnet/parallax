@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--notify-url", type=str, default=None, help="URL to notify when a request is finished"
     )
+    parser.add_argument("--key-path", type=str, default=".", help="Path to the key file")
 
     # Model configuration
     parser.add_argument(
