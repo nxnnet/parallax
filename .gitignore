@@ -15,5 +15,6 @@ build/
 .venvlinux/
 .github/
 .tests/
-调度器分配.md
-帮助.md
+help.md
+cli.py.md
+scheduling.md
