@@ -15,3 +15,5 @@ build/
 .venvlinux/
 .github/
 .tests/
+调度器分配.md
+帮助.md
