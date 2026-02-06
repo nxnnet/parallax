@@ -12,7 +12,7 @@ from typing import List, Optional, Union
 
 import aiohttp
 import huggingface_hub.constants
-from huggingface_hub import snapshot_download
+from modelscope import snapshot_download
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
@@ -138,6 +138,8 @@ async def async_request_openai_completions(
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
 
+    if pbar:
+        pbar.update(1)
     return output
 
 
@@ -187,12 +189,9 @@ async def async_request_openai_chat_completions(
             "stream_options": {
                 "include_usage": True,
             },
-            "sampling_params": {
-                "top_k": 3,
-            },
         }
         if request_func_input.ignore_eos:
-            payload["sampling_params"]["ignore_eos"] = request_func_input.ignore_eos
+            payload["ignore_eos"] = request_func_input.ignore_eos
         if request_func_input.extra_body:
             payload.update(request_func_input.extra_body)
         headers = {
@@ -238,7 +237,7 @@ async def async_request_openai_chat_completions(
                                         last_token_timestamp = timestamp
 
                                     generated_text += content
-                            if usage := data.get("usage"):
+                            elif usage := data.get("usage"):
                                 # Capture token count from trailing usage event
                                 output.output_tokens = usage.get("completion_tokens")
 
@@ -263,15 +262,17 @@ async def async_request_openai_chat_completions(
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
 
+    if pbar:
+        pbar.update(1)
     return output
 
 
 def get_model(pretrained_model_name_or_path: str) -> str:
 
     model_path = snapshot_download(
-        repo_id=pretrained_model_name_or_path,
+        model_id=pretrained_model_name_or_path,
         local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-        ignore_patterns=[".*.pt", ".*.safetensors", ".*.bin"],
+        ignore_file_pattern=[".*.pt", ".*.safetensors", ".*.bin"],
     )
     return model_path
 

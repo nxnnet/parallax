@@ -37,7 +37,6 @@ _PACKAGE_COLOR = {
     "scheduling": _Ansi.GREEN,
     "backend": _Ansi.YELLOW,
     "sglang": _Ansi.MAGENTA,
-    "vllm": _Ansi.MAGENTA,
 }
 
 
@@ -56,7 +55,6 @@ class CustomFormatter(logging.Formatter):
         record.packagecolor = _PACKAGE_COLOR.get(record.package, "")
         return super().format(record)
 
-
 class FileFormatter(logging.Formatter):
     """Formatter for file logs without ANSI colors."""
 
@@ -68,7 +66,6 @@ class FileFormatter(logging.Formatter):
         # Set empty strings for color fields to reuse the format string if needed
         # or just use a simpler format
         return super().format(record)
-
 
 def _enable_default_handler(target_module_prefix):
     """Attach the default handler to the root logger with a name-prefix filter.
@@ -93,6 +90,9 @@ def _enable_default_handler(target_module_prefix):
         def filter(self, rec: logging.LogRecord) -> bool:
             return any(rec.name.startswith(p) for p in self._prefixes)
 
+    _default_handler.addFilter(_ModuleFilter(target_module_prefix))
+    root.addHandler(_default_handler)
+
     module_filter = _ModuleFilter(target_module_prefix)
     
     if _default_handler:
@@ -102,7 +102,6 @@ def _enable_default_handler(target_module_prefix):
     if _file_handler:
         _file_handler.addFilter(module_filter)
         root.addHandler(_file_handler)
-
 
 def _initialize_if_necessary():
     global _default_handler, _file_handler
@@ -120,6 +119,7 @@ def _initialize_if_necessary():
         formatter = CustomFormatter(fmt=fmt, style="{", datefmt="%b %d %H:%M:%S")
         _default_handler = logging.StreamHandler(stream=sys.stdout)
         _default_handler.setFormatter(formatter)
+
         
         # Initialize file handler
         try:
@@ -142,19 +142,18 @@ def _initialize_if_necessary():
             _file_handler.setFormatter(file_formatter)
         except Exception as e:
             sys.stderr.write(f"Failed to initialize file logging: {e}\n")
-
         # root level from env or INFO
         logging.getLogger().setLevel("INFO")
 
         # Allow logs from our main packages by default
-        _enable_default_handler(("parallax", "scheduling", "backend", "sglang", "vllm", "router"))
+        _enable_default_handler(("parallax", "scheduling", "backend", "sglang"))
 
 
 def set_log_level(level_name: str):
     """Set the root logger level."""
     _initialize_if_necessary()
     logging.getLogger().setLevel(level_name.upper())
-    # if level_name.upper() == "DEBUG":
+    #if level_name.upper() == "DEBUG":
     os.environ["RUST_LOG"] = "info"
 
 

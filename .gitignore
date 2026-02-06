@@ -11,8 +11,11 @@ build/
 *.key
 .cache
 .vscode/
-hosts.json
 .venv/
 .venvlinux/
 .github/
 .tests/
+help.md
+cli.py.md
+scheduling.md
+*.zip

@@ -2,7 +2,7 @@
 Defines the ShardedModel class for distributing MLX models across multiple devices.
 """
 
-from typing import Any, List, Optional, Type
+from typing import Optional, Tuple, Type
 
 import mlx.core as mx
 from mlx import nn
@@ -58,8 +58,7 @@ class ShardedModel(nn.Module):
             self.norm_in = None
 
         self.layers = [
-            block_class(config, layer_idx, layer_idx - start_layer)
-            for layer_idx in range(start_layer, end_layer)
+            block_class(config, layer_idx) for layer_idx in range(start_layer, end_layer)
         ]
 
         if self.is_last_shard:
@@ -68,19 +67,6 @@ class ShardedModel(nn.Module):
         else:
             self.norm = None
             self.lm_head = None
-
-    def shard_layers(self):
-        group = mx.distributed.init()
-        tp_size = group.size()
-        if tp_size > 1:
-            for layer in self.layers:
-                if hasattr(layer, "shard"):
-                    layer.shard()
-                else:
-                    logger.error(
-                        f"Model {layer.__class__.__name__} does not have a shard method, does not support tensor parallelism"
-                    )
-                    exit(1)
 
     def logits_to_tokens(
         self,
@@ -123,20 +109,21 @@ class ShardedModel(nn.Module):
     def __call__(
         self,
         h_or_tokens: mx.array,
-        cache: Optional[List[Any]] = None,
+        cache: Optional[Tuple[mx.array, mx.array]] = None,
         mask: Optional[mx.array] = None,
         block_tables: Optional[mx.array] = None,
         context_lengths: Optional[mx.array] = None,
         slot_mapping: Optional[mx.array] = None,
-        **kwargs,
+        window_size: Optional[int] = None,
     ) -> mx.array:
         """
         Args:
             h_or_tokens:
                 (batch, target_len_padded, D) or (batch, target_len_padded) for prefill,
                 (batch, 1, D) or (batch, 1) for decode.
-            cache: List of layer caches (KVCache or LinearCache).
-                   Legacy mode: (key_cache_global, value_cache_global) tuple.
+            cache: PagedAttention:
+                   (key_cache_global, value_cache_global)
+                   has for shape: (num_layers, num_blocks, num_kv_heads, block_size, head_dim)
             lengths: (batch,) true lengths of each sequence in batch.
             mask: Optional causal mask for the current segment.
             window_size: Optional int, if provided, will use a sliding window attention mask.
@@ -165,7 +152,6 @@ class ShardedModel(nn.Module):
                 block_tables=block_tables,
                 context_lengths=context_lengths,
                 slot_mapping=slot_mapping,
-                **kwargs,
             )
 
         if self.is_last_shard:

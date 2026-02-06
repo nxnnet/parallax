@@ -30,11 +30,7 @@ MODELS = {
     "zai-org/GLM-4.6": "mlx-community/GLM-4.6-4bit",
     "zai-org/GLM-4.6-FP8": "mlx-community/GLM-4.6-4bit",
     "zai-org/GLM-4.5-Air": "lmstudio-community/GLM-4.5-Air-MLX-8bit",
-    "zai-org/GLM-4.7": "mlx-community/GLM-4.7-4bit",
-    "zai-org/GLM-4.7-Flash": "mlx-community/GLM-4.7-Flash-4bit",
-    "zai-org/GLM-4.7-Flash-FP8": "mlx-community/GLM-4.7-Flash-8bit",
-    # Minimax M2 Models
-    "MiniMaxAI/MiniMax-M2.1": "mlx-community/MiniMax-M2.1-4bit",
+    # Other Models
     "MiniMaxAI/MiniMax-M2": "mlx-community/MiniMax-M2-4bit",
     # ======================================= End ========================================#
     #
@@ -46,7 +42,6 @@ MODELS = {
     "deepseek-ai/DeepSeek-V3": "mlx-community/DeepSeek-V3-4bit",
     "deepseek-ai/DeepSeek-V2.5-1210": "mlx-community/DeepSeek-V2.5-1210-4bit",
     "deepseek-ai/DeepSeek-R1": "mlx-community/DeepSeek-R1-4bit",
-    "deepseek-ai/DeepSeek-V3.2": "mlx-community/DeepSeek-V3.2-4bit",
     # Qwen 2.5 Series
     "Qwen/Qwen2.5-0.5B-Instruct": "Qwen/Qwen2.5-0.5B-Instruct",
     "Qwen/Qwen2.5-1.5B-Instruct": "Qwen/Qwen2.5-1.5B-Instruct",

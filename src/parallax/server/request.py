@@ -75,7 +75,6 @@ class RequestStatus(Enum):
     DECODING = "DECODING"
     FINISHED_EOS = "FINISHED_EOS"
     FINISHED_MAX_LENGTH = "FINISHED_MAX_LENGTH"
-    FINISHED_ABORT = "FINISHED_ABORT"
     ERROR = "ERROR"
     CANCELLED = "CANCELLED"
 
@@ -95,7 +94,6 @@ class Request:
         output_ids: Optional[List[int]] = None,
         routing_table: Optional[List[str]] = [],
         sampling_params: Optional[SamplingParams] = None,
-        lora_path: Optional[str] = None,
     ):
         self.request_id = request_id or str(uuid.uuid4())
         self.status = status
@@ -107,8 +105,6 @@ class Request:
         self.abort = False
         self.ready_for_next_step = False
         self.last_updated_time: Optional[float] = None
-        self.lora_id: Optional[str] = None
-        self.lora_path = lora_path
 
     @property
     def is_finished(self) -> bool:
@@ -116,7 +112,6 @@ class Request:
         return self.status in [
             RequestStatus.FINISHED_EOS,
             RequestStatus.FINISHED_MAX_LENGTH,
-            RequestStatus.FINISHED_ABORT,
             RequestStatus.ERROR,
             RequestStatus.CANCELLED,
         ]
@@ -159,8 +154,6 @@ class InitialRequest(Request):
         max_new_tokens: int = 512,
         max_total_length: int = 1024,
         status: RequestStatus = RequestStatus.PREFILLING,
-        lora_path: Optional[str] = None,
-        return_probs: bool = False,
     ):
         if not prompt and not input_ids:
             raise ValueError("prompt or input_ids cannot be empty.")
@@ -170,10 +163,8 @@ class InitialRequest(Request):
             prompt_len=len(input_ids) if input_ids else 0,
             input_ids=input_ids,
             sampling_params=sampling_params,
-            lora_path=lora_path,
         )
         self.prompt = prompt
-        self.return_probs = return_probs
 
         if max_new_tokens < 1:
             raise ValueError("max_new_tokens must be at least 1.")
@@ -265,9 +256,6 @@ class IntermediateRequest(Request):
         next_token_id: Optional[int] = None,
         routing_table: Optional[List[str]] = [],
         sampling_params: Optional[SamplingParams] = None,
-        lora_path: Optional[str] = None,
-        token_prob: Optional[float] = None,
-        return_probs: bool = False,
     ):
         super().__init__(
             request_id=request_id,
@@ -275,7 +263,6 @@ class IntermediateRequest(Request):
             routing_table=routing_table,
             input_ids=input_ids,
             sampling_params=sampling_params,
-            lora_path=lora_path,
         )
         # Hidden states from the previous peer's computation.
         # Shape:
@@ -289,8 +276,6 @@ class IntermediateRequest(Request):
         self.current_position = current_position
         self.hidden_states = hidden_states
         self.next_token_id = next_token_id
-        self.token_prob = token_prob
-        self.return_probs = return_probs
 
     @property
     def input_length(self) -> int:
@@ -305,11 +290,7 @@ class IntermediateRequest(Request):
 
     @classmethod
     def from_initial_request(
-        cls,
-        initial_request: InitialRequest,
-        hidden_states: Optional[Any] = None,
-        lora_path: Optional[str] = None,
-        token_prob: Optional[float] = None,
+        cls, initial_request: InitialRequest, hidden_states: Optional[Any] = None
     ) -> "IntermediateRequest":
         """Convert an InitialRequest to an IntermediateRequest.
 
@@ -341,9 +322,6 @@ class IntermediateRequest(Request):
             hidden_states=hidden_states,
             sampling_params=initial_request.sampling_params,
             routing_table=initial_request.routing_table,
-            lora_path=lora_path,
-            token_prob=token_prob,
-            return_probs=initial_request.return_probs,
         )
 
     @classmethod
@@ -351,8 +329,6 @@ class IntermediateRequest(Request):
         cls,
         old_request: "IntermediateRequest",
         new_hidden_states: Any,
-        lora_path: Optional[str] = None,
-        token_prob: Optional[float] = None,
     ) -> "IntermediateRequest":
         """
         Creates a new IntermediateRequest from an old one, with updated hidden states.
@@ -367,9 +343,6 @@ class IntermediateRequest(Request):
             hidden_states=new_hidden_states,
             routing_table=old_request.routing_table,
             sampling_params=old_request.sampling_params,
-            lora_path=lora_path,
-            token_prob=token_prob,
-            return_probs=old_request.return_probs,
         )
 
     def __repr__(self):

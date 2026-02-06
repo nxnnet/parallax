@@ -30,7 +30,6 @@ import asyncio
 import base64
 import gc
 import io
-import itertools
 import json
 import os
 import random
@@ -435,7 +434,7 @@ def calculate_metrics(
         total_output=sum(actual_output_lens),
         request_throughput=completed / dur_s,
         request_goodput=good_completed / dur_s,
-        output_throughput=np.mean([1.0 / x for x in tpots]),
+        output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0)
         * 1000,  # ttfts is empty if streaming is not supported by backend
@@ -484,41 +483,37 @@ async def benchmark(
     ignore_eos: bool,
     goodput_config_dict: Dict[str, float],
     max_concurrency: Optional[int],
-    skip_test: bool = False,
-    time_serving: Optional[float] = None,
-    report_interval: float = 30.0,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    if not skip_test:
-        print("Starting initial single prompt test run...")
-        test_prompt, test_prompt_len, test_output_len, test_mm_content = input_requests[0]
-        if backend != "openai-chat" and test_mm_content is not None:
-            # multi-modal benchmark is only available on OpenAI Chat backend.
-            raise ValueError("Multi-modal content is only supported on 'openai-chat' backend.")
-        test_input = RequestFuncInput(
-            model=model_id,
-            model_name=model_name,
-            prompt=test_prompt,
-            api_url=api_url,
-            prompt_len=test_prompt_len,
-            output_len=test_output_len,
-            logprobs=logprobs,
-            best_of=best_of,
-            multi_modal_content=test_mm_content,
-            ignore_eos=ignore_eos,
+    print("Starting initial single prompt test run...")
+    test_prompt, test_prompt_len, test_output_len, test_mm_content = input_requests[0]
+    if backend != "openai-chat" and test_mm_content is not None:
+        # multi-modal benchmark is only available on OpenAI Chat backend.
+        raise ValueError("Multi-modal content is only supported on 'openai-chat' backend.")
+    test_input = RequestFuncInput(
+        model=model_id,
+        model_name=model_name,
+        prompt=test_prompt,
+        api_url=api_url,
+        prompt_len=test_prompt_len,
+        output_len=test_output_len,
+        logprobs=logprobs,
+        best_of=best_of,
+        multi_modal_content=test_mm_content,
+        ignore_eos=ignore_eos,
+    )
+    test_output = await request_func(request_func_input=test_input)
+    if not test_output.success:
+        raise ValueError(
+            "Initial test run failed - Please make sure benchmark arguments "
+            f"are correctly specified. Error: {test_output.error}"
         )
-        test_output = await request_func(request_func_input=test_input)
-        if not test_output.success:
-            raise ValueError(
-                "Initial test run failed - Please make sure benchmark arguments "
-                f"are correctly specified. Error: {test_output.error}"
-            )
-        else:
-            print("Initial test run completed. Starting main benchmark run...")
+    else:
+        print("Initial test run completed. Starting main benchmark run...")
 
     if profile:
         print("Starting profiler...")
@@ -547,19 +542,7 @@ async def benchmark(
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
-    if time_serving:
-        if request_rate == float("inf") and max_concurrency is None:
-            print(
-                "WARNING: time_serving enabled with infinite request_rate "
-                "and no max_concurrency. Defaulting max_concurrency to 256 "
-                "to prevent client overload."
-            )
-            max_concurrency = 256
-
-    if time_serving:
-        pbar = None if disable_tqdm else tqdm(unit="req")
-    else:
-        pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
     # This can be used once the minimum Python version is 3.10 or higher,
     # and it will simplify the code in limited_request_func.
@@ -567,85 +550,15 @@ async def benchmark(
     #                 if max_concurrency else contextlib.nullcontext())
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
-    # Live metrics for time-based serving
-    live_metrics = {
-        "completed_requests": 0,
-        "generated_tokens": 0,
-        "last_report_time": time.perf_counter(),
-        "last_completed_requests": 0,
-        "last_generated_tokens": 0,
-    }
-
-    async def reporter_func():
-        while True:
-            await asyncio.sleep(report_interval)
-            now = time.perf_counter()
-            elapsed = now - live_metrics["last_report_time"]
-
-            current_completed = live_metrics["completed_requests"]
-            current_tokens = live_metrics["generated_tokens"]
-
-            new_reqs = current_completed - live_metrics["last_completed_requests"]
-            new_tokens = current_tokens - live_metrics["last_generated_tokens"]
-
-            req_per_sec = new_reqs / elapsed if elapsed > 0 else 0
-            tok_per_sec = new_tokens / elapsed if elapsed > 0 else 0
-
-            print(f"[Report] Throughput: {req_per_sec:.2f} req/s, " f"{tok_per_sec:.2f} tokens/s")
-
-            live_metrics["last_report_time"] = now
-            live_metrics["last_completed_requests"] = current_completed
-            live_metrics["last_generated_tokens"] = current_tokens
-
-    reporter_task = None
-    if time_serving:
-        reporter_task = asyncio.create_task(reporter_func())
-
-    async def limited_request_func(request_func_input, pbar, sema=None):
-        try:
-            res = await request_func(request_func_input=request_func_input, pbar=pbar)
-        finally:
-            if sema:
-                sema.release()
-
-        if time_serving:
-            live_metrics["completed_requests"] += 1
-            if res.success:
-                # If output_tokens is 0 (e.g. backend didn't return usage),
-                # we use tokenizer to count.
-                out_tokens = res.output_tokens
-                if out_tokens == 0 and res.generated_text:
-                    out_tokens = len(
-                        tokenizer(res.generated_text, add_special_tokens=False).input_ids
-                    )
-                live_metrics["generated_tokens"] += out_tokens
-
-        if pbar is not None:
-            pbar.update(1)
-            if time_serving:
-                now = time.perf_counter()
-                total_elapsed = now - benchmark_start_time
-                if total_elapsed > 0:
-                    avg_tok_per_sec = live_metrics["generated_tokens"] / total_elapsed
-                    pbar.set_postfix_str(f"tok/s={avg_tok_per_sec:.2f}")
-
-        return res
+    async def limited_request_func(request_func_input, pbar):
+        if semaphore is None:
+            return await request_func(request_func_input=request_func_input, pbar=pbar)
+        async with semaphore:
+            return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-
-    if time_serving:
-        request_generator = get_request(itertools.cycle(input_requests), request_rate, burstiness)
-    else:
-        request_generator = get_request(input_requests, request_rate, burstiness)
-
-    async for request in request_generator:
-        if time_serving and (time.perf_counter() - benchmark_start_time) > time_serving:
-            break
-
-        if semaphore:
-            await semaphore.acquire()
-
+    async for request in get_request(input_requests, request_rate, burstiness):
         prompt, prompt_len, output_len, mm_content = request
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -661,60 +574,10 @@ async def benchmark(
         )
         tasks.append(
             asyncio.create_task(
-                limited_request_func(
-                    request_func_input=request_func_input, pbar=pbar, sema=semaphore
-                )
+                limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
-
-    # Cancel pending tasks if time is up
-    if time_serving:
-        pending = [t for t in tasks if not t.done()]
-        if pending:
-            for t in pending:
-                t.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks, return_exceptions=True)
-    # Filter out cancelled or failed tasks from outputs to avoid analysis errors
-    valid_outputs = []
-    for i, output in enumerate(outputs):
-        if isinstance(output, Exception):
-            continue
-        valid_outputs.append(output)
-
-    # Re-align input_requests to match valid_outputs
-    # Since we cycle input_requests in time_serving, we need to match the successful ones.
-    # However, outputs order in gather matches tasks order.
-    # We need to filter input_requests as well.
-
-    # Actually, better to just keep the output structure consistent but mark failed ones.
-    # But RequestFuncOutput has an error field.
-
-    final_outputs = []
-    for output in outputs:
-        if isinstance(output, asyncio.CancelledError):
-            # Create a dummy failed output
-            out = RequestFuncOutput()
-            out.error = "Cancelled due to time limit"
-            out.success = False
-            final_outputs.append(out)
-        elif isinstance(output, Exception):
-            out = RequestFuncOutput()
-            out.error = str(output)
-            out.success = False
-            final_outputs.append(out)
-        else:
-            final_outputs.append(output)
-
-    outputs = final_outputs
-
-    if reporter_task:
-        reporter_task.cancel()
-        try:
-            await reporter_task
-        except asyncio.CancelledError:
-            pass
+    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if profile:
         print("Stopping profiler...")
@@ -735,18 +598,6 @@ async def benchmark(
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
-
-    # Flatten inputs if we used cycle
-    # In time_serving mode, input_requests is a list of N prompts.
-    # But we generated M requests (where M > N).
-    # We need to reconstruct the full list of inputs corresponding to the tasks.
-    if time_serving:
-        # Re-create the sequence of inputs used
-        # We need to know exactly how many tasks were created.
-        num_tasks = len(tasks)
-        # We can slice the infinite iterator effectively by cycling the original list
-        extended_inputs = list(itertools.islice(itertools.cycle(input_requests), num_tasks))
-        input_requests = extended_inputs
 
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
@@ -1013,9 +864,6 @@ def main(args: argparse.Namespace):
             ignore_eos=args.ignore_eos,
             goodput_config_dict=goodput_config_dict,
             max_concurrency=args.max_concurrency,
-            skip_test=args.skip_test,
-            time_serving=args.time_serving,
-            report_interval=args.report_interval,
         )
     )
 
@@ -1196,11 +1044,6 @@ if __name__ == "__main__":
         "VLLM_TORCH_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
-        "--skip-test",
-        action="store_true",
-        help="Skip the initial single prompt test run.",
-    )
-    parser.add_argument(
         "--save-result",
         action="store_true",
         help="Specify to save benchmark results to a json file",
@@ -1354,21 +1197,6 @@ if __name__ == "__main__":
         help="The model name used in the API. "
         "If not specified, the model name will be the "
         "same as the ``--model`` argument. ",
-    )
-
-    parser.add_argument(
-        "--time-serving",
-        type=float,
-        default=None,
-        help="Duration in seconds to run the benchmark. "
-        "If specified, --num-prompts is ignored for termination "
-        "and requests are cycled.",
-    )
-    parser.add_argument(
-        "--report-interval",
-        type=float,
-        default=30.0,
-        help="Interval in seconds to report throughput metrics during " "time-based serving.",
     )
 
     args = parser.parse_args()

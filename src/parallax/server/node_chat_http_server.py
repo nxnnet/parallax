@@ -116,6 +116,7 @@ class NodeChatHttpServer:
             self.lattica.with_bootstraps(self.initial_peers)
 
         self.lattica.build()
+        logger.info(f"Local Node peer id: {self.lattica.peer_id()}")
 
         if len(self.relay_servers) > 0:
             try:
