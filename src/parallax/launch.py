@@ -109,8 +109,8 @@ if __name__ == "__main__":
 
             config = fetch_model_from_hf(args.model_path)
             # only launch http server on head node
-            if args.start_layer == 0:
-                http_server_process = launch_http_server(args)
+            #if args.start_layer == 0:
+            http_server_process = launch_http_server(args)
             # Launch P2P server as subprocess
             p2p_server_process = launch_p2p_server_process(
                 initial_peers=args.initial_peers,
@@ -217,8 +217,8 @@ if __name__ == "__main__":
             check_latest_release()
 
             # only launch http server on head node
-            if args.start_layer == 0:
-                http_server_process = launch_http_server(args)
+            # if args.start_layer == 0:
+            http_server_process = launch_http_server(args)
 
             # Main execution loop with layer reallocation support
             while True:
