@@ -16,8 +16,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--announce-maddrs", nargs="+", default=[], help="List of multiaddresses to announce"
     )
-    parser.add_argument("--tcp-port", type=int, default=0, help="Port for Lattica TCP listening")
-    parser.add_argument("--udp-port", type=int, default=0, help="Port for Lattica UDP listening")
+    parser.add_argument("--tcp-port", type=int, default=55250, help="Port for Lattica TCP listening")
+    parser.add_argument("--udp-port", type=int, default=55250, help="Port for Lattica UDP listening")
     parser.add_argument("--dht-prefix", type=str, default="gradient", help="Prefix for DHT keys")
 
     # Scheduler configuration
