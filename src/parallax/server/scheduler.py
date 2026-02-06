@@ -20,10 +20,10 @@ Our scheduler also handles tokenization and pre-processing for the First Peer's 
 """
 
 import time
-from collections import OrderedDict
-from typing import Dict, List, Optional
+from collections import OrderedDict, deque
+from typing import Deque, Dict, List, Optional
 
-from parallax.server.kv_cache import KVCacheManager
+from parallax.server.cache_manager import CacheManager
 from parallax.server.request import InitialRequest, Request, RequestStatus
 from parallax.utils.shared_state import SharedState
 from parallax_utils.logging_config import get_logger
@@ -41,11 +41,11 @@ class Scheduler:
     def __init__(
         self,
         max_batch_size: int = 16,
-        max_num_tokens_per_batch: int = 4096,
+        max_num_tokens_per_batch: int = 16384,
         scheduler_wait_ms: int = 200,
         micro_batch_ratio: int = 2,
         is_first_peer: bool = False,
-        kv_cache_manager: Optional[KVCacheManager] = None,
+        cache_manager: Optional[CacheManager] = None,
         request_timeout_s: Optional[int] = 600,
         shared_state: Optional[SharedState] = None,
         **kwargs,
@@ -57,7 +57,7 @@ class Scheduler:
             scheduler_wait_ms: The minimum time to wait before dispatching a batch;
             micro_batch_ratio: micro_batch_size = max_batch_size // micro_batch_ratio;
             tokenizer: The tokenizer to use for the model;
-            kv_cache_manager: The KV cache manager to use for the scheduler.
+            cache_manager: The KV cache manager to use for the scheduler.
             request_timeout_s: timeout for each inflight request (default 10mins).
         """
         self.max_batch_size = max_batch_size
@@ -73,11 +73,11 @@ class Scheduler:
             self.max_total_length = kwargs.get("max_total_length", 1024)
 
         # Prefill wait queue (FIFO) for admission
-        self._wait_queue: List[Request] = []
+        self._wait_queue: Deque[Request] = deque()
         # Keeps track of all in-flight requests
         self._running_requests: Dict[str, Request] = OrderedDict()
 
-        self.kv_cache_manager = kv_cache_manager
+        self.cache_manager = cache_manager
         self.shared_state = shared_state
         # Default timeout for requests if not set on request object
         self.request_timeout_s = request_timeout_s
@@ -158,35 +158,61 @@ class Scheduler:
             except Exception:
                 pass
         else:
-            raise ValueError(f"Attempted to evict non-existent request {request_id}.")
+            return
 
     def cancel_request(self, request_id: str):
         """Cancels a request from the scheduler."""
         if request_id in self._running_requests:
             req = self._running_requests[request_id]
             req.abort = True
-            logger.debug(f"Cancelled request {request_id} from scheduler.")
-        else:
-            raise ValueError(f"Attempted to cancel non-existent request {request_id}.")
+            logger.debug(f"Cancelled running request {request_id} from scheduler.")
+            return
+
+        # TODO: Handle efficiently when the wait queue is large.
+        for req in self._wait_queue:
+            if req.request_id == request_id:
+                self._wait_queue.remove(req)
+                logger.debug(f"Cancelled request {request_id} from wait queue.")
+                return
+
+        raise ValueError(f"Attempted to cancel non-existent request {request_id}.")
 
     def check_and_update_request_status(self, request: InitialRequest) -> bool:
         """Checks if a request has met any finishing conditions and updates its status."""
-        assert self.is_first_peer, "Only first peer can check and update request status."
-        assert (
-            self.eos_token_id is not None
-        ), "EOS token ID must be set for request status checking."
         if request.is_finished:
             return True
 
         finished = False
-        last_token_id = request.output_ids[-1] if request.output_ids else None
         if request.abort:
+            request.update_status(RequestStatus.FINISHED_ABORT)
             finished = True
-        if not request.sampling_params.ignore_eos and (
-            self.eos_token_id
+        elif request.status == RequestStatus.FINISHED_ABORT:
+            # Already marked as ABORT by executor (e.g. OOM)
+            finished = True
+
+        if finished:
+            logger.debug(f"Request {request.request_id} finished with status {request.status}.")
+            # Remove from running requests. The executor will handle KV cache release.
+            self.evict_request(request.request_id)
+            return True
+
+        if not self.is_first_peer:
+            return False
+
+        assert (
+            self.eos_token_id is not None
+        ), "EOS token ID must be set for request status checking."
+
+        last_token_id = request.output_ids[-1] if request.output_ids else None
+        if (
+            not finished
+            and not request.sampling_params.ignore_eos
             and (
-                last_token_id == self.eos_token_id
-                or (isinstance(self.eos_token_id, list) and last_token_id in self.eos_token_id)
+                self.eos_token_id
+                and (
+                    last_token_id == self.eos_token_id
+                    or (isinstance(self.eos_token_id, list) and last_token_id in self.eos_token_id)
+                )
             )
         ):
             request.update_status(RequestStatus.FINISHED_EOS)
@@ -217,22 +243,33 @@ class Scheduler:
 
         Pushes admitted requests directly into the running set.
         """
-        # TODO: pop directly from wait queue ?
         while self._wait_queue and len(self._running_requests) < self.max_batch_size:
-            req = self._wait_queue.pop(0)
+            req = self._wait_queue.popleft()
             rid = req.request_id
             if rid in self._running_requests:
                 continue
 
             # Check kv cache pool
-            if self.kv_cache_manager is not None:
-                if not self.kv_cache_manager.has_request(req.request_id):
+            if self.cache_manager is not None:
+                if not self.cache_manager.has_request(req.request_id):
                     # TODO: Handle chunked prefill, and support preemption.
-                    if not self.kv_cache_manager.allocate_request(req.request_id, req.total_length):
+                    # Pass input_ids for prefix cache matching
+                    token_ids = getattr(req, "input_ids", None)
+                    success, matched_tokens = self.cache_manager.allocate_request(
+                        req.request_id, req.total_length, token_ids=token_ids
+                    )
+                    if not success:
                         logger.warning(
                             f"Request {rid} can't be admit to running batch due to KV cache size."
                         )
-                        continue
+                        # Put back to wait queue if allocation fails
+                        self._wait_queue.appendleft(req)
+                        # Stop admitting since we are out of memory
+                        break
+                    if matched_tokens > 0:
+                        logger.debug(
+                            f"Request {rid} matched {matched_tokens} tokens from prefix cache"
+                        )
 
             # Add request to running requests
             self._running_requests[rid] = req

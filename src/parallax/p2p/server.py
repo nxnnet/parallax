@@ -9,11 +9,13 @@ It is used to handle the communication between the peers, and communicate with t
 
 import dataclasses
 import enum
-import json
 import multiprocessing
+import os
+import random
+import shutil
 import threading
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import dijkstar
 import httpx
@@ -26,6 +28,13 @@ from parallax.p2p.utils import AsyncWorker
 from parallax.server.server_info import detect_node_hardware
 from parallax.utils.shared_state import SharedState
 from parallax.utils.utils import get_zmq_socket
+from parallax.utils.weight_refit_utils import (
+    calculate_cid_manual,
+    concat_weight_partition,
+    filer_weight_cid_list,
+    parse_safetensors_from_memory,
+    release_disk_storage,
+)
 from parallax_utils.logging_config import get_logger, set_log_level
 
 logger = get_logger(__name__)
@@ -157,6 +166,21 @@ class TransformerConnectionHandler(ConnectionHandler):
             logger.exception(f"Error in rpc_abort: {e}")
         return forward_pb2.AbortResponse()
 
+    def ipc_weight_refit(
+        self,
+        refit_weight_path: str,
+        weight_version: int,
+    ):
+        encoded_weight_version = str(weight_version).encode("ascii")
+        encoded_refit_weight_path = refit_weight_path.encode("ascii")
+        try:
+            with self._recv_from_peer_lock:
+                self.recv_from_peer.send_multipart(
+                    [b"refit", encoded_refit_weight_path, encoded_weight_version]
+                )
+        except Exception as e:
+            logger.exception(f"Error in ipc_weight_refit: {e}")
+
     @rpc_stream_iter
     def chat_completion(
         self,
@@ -178,11 +202,128 @@ class TransformerConnectionHandler(ConnectionHandler):
                 else:
                     response = client.post(
                         f"http://localhost:{self.http_port}/v1/chat/completions", json=request
-                    ).json()
-                    yield json.dumps(response).encode()
+                    )
+                    yield response.content
         except Exception as e:
             logger.exception(f"Error in chat completion: {e}")
             yield b"internal server error"
+
+
+def check_and_run_weight_refit(gradient_server, message):
+    """
+    Check and trigger weight refit process.
+    Received message is a Dict which at least contains:
+        time_stamp: float,      indicating weight refit trigger time.
+        cid:        List[str],  cid list.
+        index_map:  Dict[str],  key(weight_name): value(cid)
+    """
+
+    def _download_weight_thread(cid):
+        raw_data = None
+        time_out = 20 * 60  # 20 minutes timeout
+        time_begin_get_block = time.time()
+        time_end_get_block = None
+        peer_id = None
+        while True:
+            try:
+                cur_time = time.time()
+                if cur_time - time_begin_get_block > time_out:
+                    logger.warning(f"Failed to get_block after 10 minutes! cid={cid}")
+                    return False, {}
+                peer_id, raw_data = gradient_server.lattica.get_block(cid, timeout_secs=30)
+                cid_manual = calculate_cid_manual(raw_data)
+                if cid_manual != cid:
+                    logger.warning(f"Checksum failed. Retry get_block for cid={cid}")
+                    continue
+                else:
+                    time_end_get_block = time.time()
+                    break
+            except Exception:
+                logger.warning(f"Failed to get block: {cid}. Retry in 1 second.")
+                time.sleep(1)
+        if raw_data is None:
+            raise RuntimeError(f"Failed to get block cid={cid}")
+        interval_get_block = time_end_get_block - time_begin_get_block
+        logger.info(
+            f"Finish download cid={cid}, get_block={interval_get_block}s, peer_id={peer_id}"
+        )
+        # convert raw data to dict
+        tensors = parse_safetensors_from_memory(raw_data)
+        return True, tensors
+
+    # step0. Release lattica disk storage
+    release_disk_storage()
+
+    # step1. Check weight refit trigger message
+    time_stamp = message.get("time_stamp", None)
+    index_map = message.get("index_map", None)
+    weight_version = message.get("version", 0)
+    if time_stamp is None or index_map is None:
+        return
+    if gradient_server.last_refit_time >= float(time_stamp):
+        # Weight already updated
+        return
+
+    cid_list = filer_weight_cid_list(
+        gradient_server.block_start_index,
+        gradient_server.block_end_index,
+        gradient_server.block_end_index,
+        index_map,
+    )
+    random.seed(time.time())
+    random.shuffle(cid_list)
+
+    # add sleep 10s for direct connection first
+    logger.debug(f"Received weight refit message: {message}.")
+    logger.info(f"Start dealing weight refit version: {weight_version}.")
+
+    # step2. download weight
+    weight_dir = os.path.join("/tmp", str(time_stamp))
+    folder = os.path.exists(weight_dir)
+    if not folder:
+        os.makedirs(weight_dir)
+        download_res = True
+        tensors = {}
+        while True:
+            if len(cid_list) == 0:
+                break
+            else:
+                cid = cid_list.pop()
+                logger.info(f"Start downloading refit weight {cid}")
+                res, tensors_loaded = _download_weight_thread(cid)
+                if res:
+                    tensors.update(tensors_loaded)
+                else:
+                    download_res = False
+                    break
+
+        if not download_res:
+            gradient_server.last_refit_time = float(time_stamp)
+            logger.info(f"Error in updating weight. Still holds the previous version of weight.")
+
+        # step3. concat weight
+        # workaround: create sub-process to avoid GIL issues for lattica
+        logger.info(f"Start sub-process to concat weight partitions in {weight_dir}")
+        if gradient_server.weight_refit_mode == "cpu":
+            new_tensors = concat_weight_partition(tensors)
+            gradient_server.conn.send(new_tensors)
+        elif gradient_server.weight_refit_mode == "disk":
+            concat_weight_partition(tensors, weight_dir)
+        else:
+            logger.warning(f"Unrecognized weight refit mode: {gradient_server.weight_refit_mode}")
+
+        # step4. send ipc message to update weight
+        gradient_server.connection_handler.ipc_weight_refit(weight_dir, weight_version)
+        last_refit_time = float(time_stamp)
+        gradient_server.last_refit_time = last_refit_time
+        gradient_server.refit_timestamp_history.append(last_refit_time)
+        gradient_server.check_and_release_disk_weight()
+        logger.info(
+            f"Finish download weight_version={weight_version}, last_refit_time={gradient_server.last_refit_time}"
+        )
+    else:
+        logger.warning(f"Already satisfies weight_version={weight_version}")
+    gradient_server.refit_finish = True
 
 
 class GradientServer:
@@ -203,6 +344,7 @@ class GradientServer:
         block_end_index: int = 1,
         hidden_layers: int = 128,
         tp_size: int = 1,
+        dp_size: int = 1,
         dht_prefix: str = "gradient",
         host_maddrs: List[str] = [],
         http_port: Optional[int] = None,
@@ -224,6 +366,7 @@ class GradientServer:
         self.block_end_index = block_end_index
         self.hidden_layers = hidden_layers
         self.tp_size = tp_size
+        self.dp_size = dp_size
         self.dht_prefix = dht_prefix
         self.host_maddrs = host_maddrs
         self.announce_maddrs = announce_maddrs
@@ -246,6 +389,7 @@ class GradientServer:
         self.rtt_update_interval = 60
         self.status = ServerState.JOINING
         self.manual_layer_assignment = block_end_index is not None and block_start_index is not None
+        self.conn = conn
 
         self.scheduler_stub = None
         self.scheduler_peer_id = None
@@ -265,9 +409,25 @@ class GradientServer:
                 block_end_index=self.block_end_index,
                 model_name=self.model_name,
                 tp_size=self.tp_size,
+                enable_weight_refit=self.enable_weight_refit,
+                weight_refit_mode=self.weight_refit_mode,
                 status=self.status.value,
                 _layer_allocation_changed=self._layer_allocation_changed,
             )
+
+    def check_and_release_disk_weight(self):
+        """Only save 3 history versions of weight"""
+        while len(self.refit_timestamp_history) > 3:
+            time_stamp = self.refit_timestamp_history.pop(0)
+            weight_dir = os.path.join("/tmp", str(int(time_stamp)))
+            if os.path.isdir(weight_dir):
+                try:
+                    shutil.rmtree(weight_dir)
+                    logger.info(f"Folder '{weight_dir}' and all its contents have been removed.")
+                except OSError as e:
+                    logger.exception(f"Error: {weight_dir} : {e.strerror}")
+            else:
+                logger.warning(f"Folder '{weight_dir}' does not exist.")
 
     def build_lattica(self):
         self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs).with_key_path(self.key_path)
@@ -366,6 +526,8 @@ class GradientServer:
                     self.block_end_index = response.get("end_layer")
                 self.model_name = response.get("model_name")
                 self.tp_size = response.get("tp_size")
+                self.enable_weight_refit = response.get("enable_weight_refit")
+                self.weight_refit_mode = response.get("weight_refit_mode")
 
                 # Sync to shared state if available
                 self._sync_to_shared_state()
@@ -590,7 +752,7 @@ class GradientServer:
                                 self.get_node_info(is_update=True)
                             )
                             # Get the response result
-                            response = (
+                            response, refit_message = (
                                 response_future.result(timeout=30)
                                 if hasattr(response_future, "result")
                                 else response_future
@@ -645,6 +807,30 @@ class GradientServer:
                                 logger.warning(
                                     f"Heartbeat: No layer allocation received yet, response: {response}"
                                 )
+                                self.status = ServerState.JOINING
+                                self.model_name = None
+                                if self._shared_state is not None:
+                                    self._shared_state.set_status(self.status.value)
+                                    self._shared_state.update_metrics(current_requests=0)
+                                    self._shared_state.set("model_name", None)
+                                logger.debug(
+                                    "Status set to JOINING and model_name to None because no valid layer allocation received yet."
+                                )
+                            if refit_message and isinstance(refit_message, dict):
+                                if self.enable_weight_refit:
+                                    logger.info(f"Server begin weight refit process.")
+                                    if self.refit_finish:
+                                        self.refit_finish = False
+                                        t = threading.Thread(
+                                            target=check_and_run_weight_refit,
+                                            args=(self, refit_message),
+                                            daemon=True,
+                                        )
+                                        t.start()
+                                else:
+                                    logger.warning(
+                                        f"Received weight refit request but enable_weight_refit is set to {self.enable_weight_refit}."
+                                    )
                         else:
                             self.lattica.store(
                                 key=self.prefix_id,
@@ -729,6 +915,7 @@ class GradientServer:
             "rtt_to_nodes": self.rtts,
             "status": self._get_status(),
             "is_active": self._get_status() == ServerState.READY.value,
+            "last_refit_time": self.last_refit_time,
         }
 
         # For manual layer assignment, always include start_layer and end_layer
@@ -781,6 +968,7 @@ def _run_p2p_server_process(
     pp_end_layer: int,
     hidden_layers: int,
     tp_size: int,
+    dp_size: int,
     tcp_port: int,
     udp_port: int,
     dht_prefix: str,
@@ -813,6 +1001,7 @@ def _run_p2p_server_process(
             block_end_index=pp_end_layer,
             hidden_layers=hidden_layers,
             tp_size=tp_size,
+            dp_size=dp_size,
             dht_prefix=dht_prefix,
             host_maddrs=[
                 f"/ip4/0.0.0.0/tcp/{tcp_port}",
@@ -838,6 +1027,8 @@ def _run_p2p_server_process(
                 block_end_index=server.block_end_index,
                 model_name=server.model_name,
                 tp_size=server.tp_size,
+                enable_weight_refit=False,
+                weight_refit_mode="disk",
                 status=server.status.value,
             )
 
@@ -859,6 +1050,7 @@ def launch_p2p_server_process(
     pp_end_layer: int,
     hidden_layers: int,
     tp_size: int,
+    dp_size: int,
     tcp_port: int,
     udp_port: int,
     dht_prefix: str,
@@ -893,6 +1085,7 @@ def launch_p2p_server_process(
             pp_end_layer,
             hidden_layers,
             tp_size,
+            dp_size,
             tcp_port,
             udp_port,
             dht_prefix,

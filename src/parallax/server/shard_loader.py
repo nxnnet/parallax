@@ -10,14 +10,13 @@ import types
 from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
-import safetensors
 from huggingface_hub import snapshot_download
 from mlx import nn
 from mlx.utils import tree_unflatten
 from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
 from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
-from mlx_lm.utils import get_model_path, load_config
+from mlx_lm.utils import _download, load_config
 
 from parallax.server.model import ShardedModel
 from parallax.utils.tokenizer_utils import load_tokenizer
@@ -27,7 +26,6 @@ logger = get_logger(__name__)
 
 MODEL_CLASS_MAP = {
     "kimi_k2": "mlx_lm.models.deepseek_v3",
-    "minimax": "parallax.models.minimax",
 }
 
 
@@ -211,7 +209,7 @@ class MLXModelLoader:
         return base_model
 
     def load(
-        self, lazy: bool = False, strict: bool = True, use_selective_download: bool = True
+        self, lazy: bool = False, strict: bool = False, use_selective_download: bool = True
     ) -> Tuple[nn.Module, Dict[str, Any], Any]:
         """
         Loads the specified model shard by loading only the necessary weights
@@ -242,7 +240,7 @@ class MLXModelLoader:
                 local_files_only=self.use_hfcache,
             )
         else:
-            model_path = get_model_path(self.model_path_str)[0]
+            model_path = _download(self.model_path_str)
 
         config = load_config(model_path)
         tokenizer = load_tokenizer(model_path, eos_token_ids=config.get("eos_token_id", None))
@@ -332,68 +330,63 @@ class MLXModelLoader:
                 f"Scanning weight file {file_idx + 1}/{len(weight_files)}: {pathlib.Path(wf).name}"
             )
 
-            with safetensors.safe_open(wf, framework="pt") as f:
-                for key in f.keys():
-                    is_needed = False
-                    remapped_key = None
+            f = mx.load(wf)
+            for key in f.keys():
+                is_needed = False
+                remapped_key = None
 
-                    # Check if the key belongs to the shard and remap it
-                    if (
-                        model_shard.is_first_shard
-                        and "embed_tokens" in key
-                        and key.startswith("model.")
-                    ):
+                # Check if the key belongs to the shard and remap it
+                if (
+                    model_shard.is_first_shard
+                    and "embed_tokens" in key
+                    and key.startswith("model.")
+                ):
+                    is_needed = True
+                    remapped_key = key.replace("model.", "", 1)
+                    if model_shard.is_last_shard and config.get("tie_word_embeddings", False):
+                        # Also add lm_head mapping for tied embeddings
+                        lm_head_key = remapped_key.replace("embed_tokens", "lm_head")
+                        shard_weights[lm_head_key] = f[key]
+                elif model_shard.is_last_shard:
+                    if "model.norm" in key:
                         is_needed = True
                         remapped_key = key.replace("model.", "", 1)
-                        if model_shard.is_last_shard and config.get("tie_word_embeddings", False):
-                            # Also add lm_head mapping for tied embeddings
-                            lm_head_key = remapped_key.replace("embed_tokens", "lm_head")
-                            shard_weights[lm_head_key] = mx.array(f.get_tensor(key))
-                    elif model_shard.is_last_shard:
-                        if "model.norm" in key:
-                            is_needed = True
-                            remapped_key = key.replace("model.", "", 1)
-                        if "lm_head" in key:
-                            is_needed = True
-                            remapped_key = key
-                        elif (
-                            config.get("tie_word_embeddings", False)
-                            and "embed_tokens" in key
-                            and key.startswith("model.embed_tokens")
-                        ):
-                            is_needed = True
-                            remapped_key = key.replace("model.", "", 1).replace(
-                                "embed_tokens", "lm_head"
-                            )
-                    if layer_key_prefix in key:
-                        try:
-                            parts = key.split(".")
-                            layer_idx = int(parts[2])
-                            if current_start_layer <= layer_idx < current_end_layer:
-                                is_needed = True
-                                local_layer_idx = layer_idx - current_start_layer
-                                remapped_key = f"layers.{local_layer_idx}.{'.'.join(parts[3:])}"
-                        except (ValueError, IndexError):
-                            continue
-
-                    # If the key is needed, load only that tensor from the file
-                    if is_needed:
-                        # Load tensor
-                        tensor = f.get_tensor(key)
-                        weight_array = mx.array(tensor)
-
-                        # Only convert dtype for non-quantized weights
-                        # Quantized weights (uint32, int32) and their scales/biases should keep their original dtype
-                        # Scales are typically float32 and should not be downcast to bfloat16
-                        is_quantized_param = (
-                            weight_array.dtype in (mx.uint32, mx.int32)
-                            or ".scales" in remapped_key
-                            or ".bias" in remapped_key
+                    if "lm_head" in key:
+                        is_needed = True
+                        remapped_key = key
+                    elif (
+                        config.get("tie_word_embeddings", False)
+                        and "embed_tokens" in key
+                        and key.startswith("model.embed_tokens")
+                    ):
+                        is_needed = True
+                        remapped_key = key.replace("model.", "", 1).replace(
+                            "embed_tokens", "lm_head"
                         )
-                        if not is_quantized_param:
-                            weight_array = weight_array.astype(dtype)
+                if layer_key_prefix in key:
+                    try:
+                        parts = key.split(".")
+                        layer_idx = int(parts[2])
+                        if current_start_layer <= layer_idx < current_end_layer:
+                            is_needed = True
+                            local_layer_idx = layer_idx - current_start_layer
+                            remapped_key = f"layers.{local_layer_idx}.{'.'.join(parts[3:])}"
+                    except (ValueError, IndexError):
+                        continue
 
-                        shard_weights[remapped_key] = weight_array
+                # If the key is needed, load only that tensor from the file
+                if is_needed:
+                    # Load tensor (Lazy in MLX)
+                    weight_array = f[key]
+
+                    # Only convert dtype for non-quantized weights
+                    # Quantized weights (uint32, int32) and their scales/biases should keep their original dtype
+                    # Scales are typically float32 and should not be downcast to bfloat16
+                    is_quantized_param = weight_array.dtype in (mx.uint32, mx.int32, mx.uint8)
+                    if not is_quantized_param and weight_array.dtype != dtype:
+                        weight_array = weight_array.astype(dtype)
+
+                    shard_weights[remapped_key] = weight_array
 
         if (quantization := config.get("quantization", None)) is not None:
             logger.debug("Model is quantized. Applying quantization parameters...")
@@ -428,9 +421,13 @@ class MLXModelLoader:
             )
 
         model_shard.load_weights(list(shard_weights.items()), strict=strict)
+        model_shard.shard_layers()
 
-        if not lazy:
-            mx.eval(model_shard.parameters())
+        shard_weights.clear()
+
+        mx.eval(model_shard.parameters())
+        # Synchronize processes to avoid timeout
+        mx.eval(mx.distributed.all_sum(mx.array(1.0)))
         model_shard.eval()
         logger.info(
             "Successfully loaded model shard (layers [%d-%d)), memory usage: %.3f GB",
@@ -439,3 +436,107 @@ class MLXModelLoader:
             mx.get_active_memory() / 1024**3,
         )
         return model_shard, config, tokenizer
+
+    def update_weight_from_disk(self, model_shard: nn.Module, refit_weight_path: str):
+        """Runtime weight refit from disk"""
+        weight_files = glob.glob(refit_weight_path + "/*.safetensors")
+        if not weight_files:
+            raise FileNotFoundError(f"No safetensors found in {refit_weight_path}")
+
+        logger.info(f"Begin refit weight from path: {refit_weight_path}")
+        shard_weights = {}
+        layer_key_prefix = "model.layers"  # Common prefix
+
+        for wf in weight_files:
+            # Use mx.load for lazy loading
+            f = mx.load(wf)
+            for key in f.keys():
+                is_needed = False
+                remapped_key = None
+
+                # Check if the key belongs to the shard and remap it
+                if (
+                    model_shard.is_first_shard
+                    and "embed_tokens" in key
+                    and key.startswith("model.")
+                ):
+                    is_needed = True
+                    remapped_key = key.replace("model.", "", 1)
+                    if model_shard.is_last_shard and self.config.get("tie_word_embeddings", False):
+                        shard_weights["lm_head.weight"] = f[key]
+                elif model_shard.is_last_shard:
+                    if "model.norm" in key:
+                        is_needed = True
+                        remapped_key = key.replace("model.", "", 1)
+                    if "lm_head" in key:
+                        is_needed = True
+                        remapped_key = key
+                    elif (
+                        self.config.get("tie_word_embeddings", False)
+                        and "embed" in key
+                        and key.startswith("model.embed_tokens")
+                    ):
+                        # TODO: we don't need load lm_head in this case
+                        # as we will pass hidden_states to FirstPeer
+                        # see request.py for details
+                        is_needed = True
+                        remapped_key = "lm_head.weight"
+                if layer_key_prefix in key:
+                    try:
+                        parts = key.split(".")
+                        layer_idx = int(parts[2])
+                        if self.start_layer <= layer_idx < self.end_layer:
+                            is_needed = True
+                            local_layer_idx = layer_idx - self.start_layer
+                            remapped_key = f"layers.{local_layer_idx}.{'.'.join(parts[3:])}"
+                    except (ValueError, IndexError):
+                        continue
+
+                # If the key is needed, load only that tensor from the file
+                if is_needed:
+                    shard_weights[remapped_key] = f[key]
+
+        if (quantization := self.config.get("quantization", None)) is not None:
+            logger.info("Model is quantized. Applying quantization parameters...")
+
+            def class_predicate(p, m):
+                # Handle custom per-layer quantizations from the config
+                qcfg = self.config.get("quantization", {})
+                # Direct key (Parallax remapped keys usually drop the 'model.' prefix)
+                if p in qcfg:
+                    override = qcfg[p]
+                    if isinstance(override, dict):
+                        logger.debug(
+                            f"[quantize] Using override for '{p}': bits={override.get('bits')} group_size={override.get('group_size')}"
+                        )
+                    return override
+                # Allow config keys that still include the original 'model.' prefix (as in mlx-lm)
+                prefixed = f"model.{p}"
+                if prefixed in qcfg:
+                    override = qcfg[prefixed]
+                    if isinstance(override, dict):
+                        logger.debug(
+                            f"[quantize] Using override for '{prefixed}' (mapped to '{p}'): bits={override.get('bits')} group_size={override.get('group_size')}"
+                        )
+                    return override
+                if not hasattr(m, "to_quantized"):
+                    return False
+                # Handle legacy models by checking if quantized weights exist
+                return f"{p}.scales" in shard_weights
+
+            nn.quantize(
+                model_shard,
+                group_size=quantization["group_size"],
+                bits=quantization["bits"],
+                mode=quantization.get("mode", "affine"),
+                class_predicate=class_predicate,
+            )
+
+        model_shard.load_weights(list(shard_weights.items()), strict=False)
+        mx.eval(model_shard.parameters())
+        model_shard.eval()
+        logger.info(
+            "Successfully updated model shard from %s, memory usage: %.3f GB",
+            refit_weight_path,
+            mx.get_active_memory() / 1024**3,
+        )

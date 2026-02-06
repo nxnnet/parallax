@@ -105,7 +105,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--kv-block-size", type=int, default=64, help="Block size for KV cache management"
+        "--kv-block-size", type=int, default=32, help="Block size for KV cache management"
     )
 
     parser.add_argument(
@@ -123,7 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-num-tokens-per-batch",
         type=int,
-        default=1024,
+        default=16384,
         help="Maximum number of tokens in a batch",
     )
 
@@ -136,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--micro-batch-ratio", type=int, default=2, help="Micro batch ratio for scheduling"
+        "--micro-batch-ratio", type=int, default=1, help="Micro batch ratio for scheduling"
     )
 
     parser.add_argument(
@@ -150,6 +150,17 @@ def parse_args() -> argparse.Namespace:
         help="Per-request timeout in seconds before automatic abort",
     )
 
+    # Online weight refit configuration
+    parser.add_argument(
+        "--enable-weight-refit", action="store_true", help="Enable runtime weight refit"
+    )
+    parser.add_argument(
+        "--weight-refit-mode",
+        type=str,
+        default="disk",
+        help="Refit mode to choose where. Choices 'cpu' or 'disk'",
+    )
+
     # GPU/SGLang specialized configuration
     parser.add_argument(
         "--attention-backend",
@@ -157,6 +168,12 @@ def parse_args() -> argparse.Namespace:
         default="flashinfer",
         choices=["torch_native", "flashinfer", "triton", "fa3"],
         help="Choose the GPU attention kernels",
+    )
+
+    parser.add_argument(
+        "--enable-dp-attention",
+        action="store_true",
+        help="Enable data parallel attention (e.g. for DeepSeek)",
     )
 
     parser.add_argument(
@@ -204,7 +221,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-loras-per-batch",
         type=int,
-        default=8,
+        default=2,
         help="Maximum number of adapters for a running batch, include base-only request.",
     )
 
@@ -226,7 +243,7 @@ def parse_args() -> argparse.Namespace:
         "--lora-backend",
         choices=["triton", "csgmv"],
         default="triton",
-        help="Choose the kernel backend for multi-LoRA serving.",
+        help="Choose the kernel backend for multi-LoRA serving. (SGLang only)",
     )
 
     parser.add_argument(
@@ -234,11 +251,25 @@ def parse_args() -> argparse.Namespace:
         choices=[16, 32, 64, 128],
         type=int,
         default=16,
-        help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
+        help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance. (SGLang only)",
+    )
+
+    parser.add_argument(
+        "--fully-sharded-loras",
+        action="store_true",
+        help="By default, only half of the LoRA computation is sharded with tensor parallelism. Enabling this will use the fully sharded layers. At high sequence length, max rank or tensor parallel size, this is likely faster. (vLLM only)",
+    )
+
+    parser.add_argument(
+        "--enable-return-routed-experts",
+        action="store_true",
+        help="Enable returning MoE routed experts for rollout replay (vLLM only, single peer).",
     )
 
     # Tensor parallel configuration
     parser.add_argument("--tp-size", type=int, default=1, help="Tensor parallel size")
+
+    parser.add_argument("--dp-size", type=int, default=1, help="Data parallel size")
 
     parser.add_argument(
         "--nccl-port",
@@ -270,7 +301,7 @@ def parse_args() -> argparse.Namespace:
         "--use-hfcache",
         action="store_true",
         default=False,
-        help="Use local Hugging Face cache only (no network download)",
+        help="Whether to use local Hugging Face cache only (no network download)",
     )
 
     args = parser.parse_args()
@@ -327,6 +358,10 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if getattr(args, "request_timeout_s", None) is not None and args.request_timeout_s <= 0:
         raise ValueError("request_timeout_s must be positive")
+
+    # Validate weight-refit args
+    if args.enable_weight_refit and args.weight_refit_mode not in ["cpu", "disk"]:
+        raise ValueError("Unrecognized refit mode. Choose 'cpu' or 'disk'")
 
     # Validate supported dtypes
     dtype_list = [

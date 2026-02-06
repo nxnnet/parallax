@@ -185,6 +185,9 @@ class Node:
     end_layer: Optional[int] = None  # exclusive
     current_requests: int = 0
 
+    # Runtime weight refit for RL
+    last_refit_time: float = 0.0
+
     # todo upload is_active
     is_active: bool = True
     last_heartbeat: float = 0.0
@@ -237,7 +240,7 @@ class Node:
         if self.max_concurrent_requests is None:
             return derived_max
         else:
-            return min(self.max_concurrent_requests, derived_max)
+            return max(self.max_concurrent_requests, derived_max)
 
     @property
     def num_current_layers(self) -> int:
@@ -359,9 +362,6 @@ class Node:
     def layer_latency_ms(self) -> float:
         """Get effective layer latency considering both roofline and load."""
         if self.is_overloaded:
-            logger.warning(
-                f"Node {self.node_id} is overloaded: {self.current_requests} >= {self.max_requests}"
-            )
             return float("inf")
         if self.avg_layer_latency_ms is None:
             return self.roofline_layer_latency_ms()
@@ -384,6 +384,10 @@ class Node:
         if self.rtt_to_nodes is None:
             return float("inf")
         if other.node_id not in self.rtt_to_nodes:
+            # Best-effort fallback: in real deployments RTT may be reported only from one side.
+            # Treat RTT as symmetric for routing/selection purposes if reverse RTT exists.
+            if other.rtt_to_nodes is not None and self.node_id in other.rtt_to_nodes:
+                return other.rtt_to_nodes[self.node_id]
             logger.warning("Cannot find RTT from node %s to node %s", self.node_id, other.node_id)
             return float("inf")
         return self.rtt_to_nodes[other.node_id]
@@ -404,3 +408,13 @@ class Node:
     def remove_request(self):
         """Remove a request from this node."""
         self.current_requests -= 1
+
+    def clear_serving_state(self) -> None:
+        """Clear serving/runtime state for this node.
+
+        TODO: Verify the worker side / p2p server side state is kept in sync with this reset
+        (e.g. any runtime KV cache, in-flight request bookkeeping, and broadcasted metrics).
+        """
+        self.clear_layer_allocation()
+        self.current_requests = 0
+        self.avg_layer_latency_ms = None

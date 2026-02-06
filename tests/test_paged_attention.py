@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from parallax.metal.paged_attention.kernel import paged_attention, reshape_and_cache
+from parallax.utils.utils import is_metal_available
 
 
 def ref_masked_attention(q, k, v, scale):
@@ -55,6 +56,9 @@ class TestPagedAttention:
     @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
     def test_basic_functionality(self, dtype):
         """Test reshape_and_cache and paged_attention with different dtypes on small data."""
+        if not is_metal_available():
+            pytest.skip("Metal backend not available (requires macOS with Metal support)")
+
         # Check for bfloat16 support
         if dtype == mx.bfloat16:
             try:
@@ -68,19 +72,13 @@ class TestPagedAttention:
         NUM_KV_HEADS = 4
         HEAD_DIM = 32
         BLOCK_SIZE = 16
-        NUM_LAYERS = 1
         NUM_BLOCKS = 1024
-        LAYER_IDX = 0
         SCALE = 1.0 / math.sqrt(HEAD_DIM)
         atol = 1e-2 if dtype != mx.float32 else 1e-4
 
-        # Setup Memory
-        key_cache = mx.zeros(
-            (NUM_LAYERS, NUM_BLOCKS, NUM_KV_HEADS, BLOCK_SIZE, HEAD_DIM), dtype=dtype
-        )
-        value_cache = mx.zeros(
-            (NUM_LAYERS, NUM_BLOCKS, NUM_KV_HEADS, BLOCK_SIZE, HEAD_DIM), dtype=dtype
-        )
+        # Setup Memory (single layer cache, shape: (1, num_blocks, num_kv_heads, block_size, head_dim))
+        key_cache = mx.zeros((1, NUM_BLOCKS, NUM_KV_HEADS, BLOCK_SIZE, HEAD_DIM), dtype=dtype)
+        value_cache = mx.zeros((1, NUM_BLOCKS, NUM_KV_HEADS, BLOCK_SIZE, HEAD_DIM), dtype=dtype)
 
         # Mock Block Tables
         max_blocks_per_req = 2
@@ -96,7 +94,7 @@ class TestPagedAttention:
         k_new = mx.random.uniform(shape=(BATCH_SIZE, NUM_KV_HEADS, 1, HEAD_DIM)).astype(dtype)
         v_new = mx.random.uniform(shape=(BATCH_SIZE, NUM_KV_HEADS, 1, HEAD_DIM)).astype(dtype)
 
-        new_k_cache, new_v_cache = reshape_and_cache(
+        reshape_and_cache(
             k_new,
             v_new,
             key_cache,
@@ -104,24 +102,22 @@ class TestPagedAttention:
             block_tables,
             context_lengths,
             BLOCK_SIZE,
-            LAYER_IDX,
         )
-        mx.eval(new_k_cache, new_v_cache)
 
         # Verify Data in Cache
         # Req 0 (len 20) -> Block 1, Offset 3
-        cached_k_0 = new_k_cache[0, 1, :, 3, :]
+        cached_k_0 = key_cache[0, 1, :, 3, :]
         input_k_0 = k_new[0].squeeze(1)
         assert mx.allclose(cached_k_0, input_k_0, atol=atol).item(), "Cache update failed for Req 0"
 
         # Req 1 (len 5) -> Block 2, Offset 4
-        cached_k_1 = new_k_cache[0, 2, :, 4, :]
+        cached_k_1 = key_cache[0, 2, :, 4, :]
         input_k_1 = k_new[1].squeeze(1)
         assert mx.allclose(
             cached_k_1, input_k_1, atol=atol
         ).item(), "Cache update failed for Req 1 (Key)"
 
-        cached_v_1 = new_v_cache[0, 2, :, 4, :]
+        cached_v_1 = value_cache[0, 2, :, 4, :]
         input_v_1 = v_new[1].squeeze(1)
         assert mx.allclose(
             cached_v_1, input_v_1, atol=atol
@@ -132,14 +128,13 @@ class TestPagedAttention:
 
         output = paged_attention(
             q,
-            new_k_cache,
-            new_v_cache,
+            key_cache,
+            value_cache,
             block_tables,
             context_lengths,
             BLOCK_SIZE,
             SCALE,
             NUM_KV_HEADS,
-            LAYER_IDX,
         )
         mx.eval(output)
 
@@ -195,6 +190,9 @@ class TestPagedAttention:
         Test paged_attention correctness on larger scales with MHA/GQA.
         Uses float16 for reasonable memory usage/precision check.
         """
+        if not is_metal_available():
+            pytest.skip("Metal backend not available (requires macOS with Metal support)")
+
         batch_size = params["bs"]
         seq_len = params["len"]
         num_heads = params["heads"]
@@ -207,7 +205,7 @@ class TestPagedAttention:
         num_blocks_per_req = (seq_len + block_size - 1) // block_size
         total_blocks = num_blocks_per_req * batch_size
 
-        # Setup Cache
+        # Setup Cache (single layer, shape: (1, total_blocks, num_kv_heads, block_size, head_dim))
         key_cache = mx.zeros((1, total_blocks, num_kv_heads, block_size, head_dim), dtype=dtype)
         value_cache = mx.zeros((1, total_blocks, num_kv_heads, block_size, head_dim), dtype=dtype)
 
@@ -254,7 +252,7 @@ class TestPagedAttention:
         value_cache = v_ready[None, ...]
         mx.eval(key_cache, value_cache)
 
-        # Run Kernel
+        # Run Kernel (no layer_idx needed)
         out = paged_attention(
             q,
             key_cache,
@@ -264,7 +262,6 @@ class TestPagedAttention:
             block_size,
             scale,
             num_kv_heads,
-            0,
         )
         mx.eval(out)
 
@@ -287,6 +284,9 @@ class TestPagedAttention:
         """
         Benchmark PagedAttention vs Native MLX SDPA.
         """
+        if not is_metal_available():
+            pytest.skip("Metal backend not available (requires macOS with Metal support)")
+
         # Config
         batch_size = 8
         num_heads = 32
@@ -356,7 +356,6 @@ class TestPagedAttention:
                 block_size,
                 scale,
                 num_kv_heads,
-                0,
             )
             mx.eval(_)
 
@@ -371,7 +370,6 @@ class TestPagedAttention:
                 block_size,
                 scale,
                 num_kv_heads,
-                0,
             )
             mx.eval(out)
         end = time.perf_counter()
