@@ -22,7 +22,7 @@ import traceback
 import uuid
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Any, Dict, List, Optional
+from typing import Dict, Optional
 
 import fastapi
 import uvicorn
@@ -35,11 +35,7 @@ from pydantic import BaseModel
 from starlette.datastructures import State
 
 from parallax.utils.selective_download import download_metadata_only
-from parallax.utils.tokenizer_utils import (
-    ToolCallState,
-    load_detokenizer,
-    load_tokenizer,
-)
+from parallax.utils.tokenizer_utils import load_detokenizer, load_tokenizer
 from parallax.utils.utils import get_zmq_socket
 from parallax_utils.logging_config import get_logger
 
@@ -91,16 +87,6 @@ class HTTPRequestInfo:
     error_message: Optional[str] = None
     error_type: Optional[str] = None
     error_status: HTTPStatus = HTTPStatus.INTERNAL_SERVER_ERROR
-    # probs support
-    return_probs: bool = False  # Whether to return probabilities
-    probs_list: List = field(default_factory=list)  # Store probs for each token
-    token_ids_list: List = field(default_factory=list)  # Store token IDs for each token
-    routed_experts: Optional[List] = None  # Routed experts for rollout replay
-    # Weight version for RL
-    weight_version: Optional[int] = None
-    # tool calling support
-    tool_state: Optional[ToolCallState] = None
-    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class HTTPHandler:
@@ -142,7 +128,6 @@ class HTTPHandler:
         rid = request["rid"]
         stream = request.get("stream", False)
         model = request.get("model", "default")
-        return_probs = request.get("return_probs", False)  # Check if probs requested
         chat_object = "chat.completion.chunk" if stream else "chat.completion"
         detokenizer = self.detokenizer_class(self.tokenizer, self.tokenmap)
         create_time = time.time()
@@ -155,10 +140,6 @@ class HTTPHandler:
             create_time=create_time,
             update_time=update_time,
             detokenizer=detokenizer,
-            return_probs=return_probs,
-        )
-        request_info.tool_state = ToolCallState.from_tokenizer(
-            self.tokenizer, request.get("tools"), stream
         )
         if stream:
             request_info.token_queue = asyncio.Queue()
@@ -170,11 +151,6 @@ class HTTPHandler:
 
     def send_request(self, request: Dict):
         """Sends the request to model executor using IPC."""
-        # Ensure return_probs is included in the request sent to executor
-        rid = request.get("rid")
-        if rid and rid in self.processing_requests:
-            request_info = self.processing_requests[rid]
-            request["return_probs"] = request_info.return_probs
         self.send_to_executor.send_pyobj(request)
 
     def abort_request(self, request_id: str):
@@ -209,18 +185,12 @@ class HTTPHandler:
             content = ""
             if "minimax-m2" in self.model_path_str.lower():
                 content = "<think>"
-            tool_calls = None
         elif is_last:
             role = None
             content = None
-            tool_calls = None
         else:
             role = None
             content = token
-            tool_calls = None
-            if isinstance(token, dict) and token.get("type") == "tool_calls":
-                content = None
-                tool_calls = token.get("tool_calls")
 
         response = {
             "id": rid,
@@ -242,19 +212,7 @@ class HTTPHandler:
             },
         }
         choice = response["choices"][0]
-        delta = {"role": role, "content": content}
-        if tool_calls is not None:
-            delta["tool_calls"] = tool_calls
-        choice["delta"] = delta
-        # Add probs in the last chunk if requested (convert to object array format)
-        if is_last and request_info.return_probs:
-            choice["probs"] = [
-                {self.tokenizer.decode([token_id]): prob}
-                for token_id, prob in zip(request_info.token_ids_list, request_info.probs_list)
-            ]
-            choice["token_ids"] = request_info.token_ids_list
-        if request_info.weight_version is not None:
-            response["weight_version"] = request_info.weight_version
+        choice["delta"] = {"role": role, "content": content}
         response_json = json.dumps(response, separators=(",", ":"))
         return f"data: {response_json}\n\n".encode()
 
@@ -320,19 +278,8 @@ class HTTPHandler:
             "role": "assistant",
             "content": request_info.text,
             "reasoning_content": None,
-            "tool_calls": request_info.tool_calls or None,
+            "tool_calls": None,
         }
-        # Add probs if requested (convert to object array format)
-        if request_info.return_probs:
-            choice["probs"] = [
-                {self.tokenizer.decode([token_id]): prob}
-                for token_id, prob in zip(request_info.token_ids_list, request_info.probs_list)
-            ]
-            choice["token_ids"] = request_info.token_ids_list
-        if request_info.routed_experts is not None:
-            choice["routed_experts"] = request_info.routed_experts
-        if request_info.weight_version is not None:
-            response["weight_version"] = request_info.weight_version
         return response
 
     async def _handle_executor_error(self, rid: str, recv_dict: Dict):
@@ -383,30 +330,8 @@ class HTTPHandler:
             request_info.completion_tokens += 1
             request_info.detokenizer.add_token(next_token_id)
             output = request_info.detokenizer.last_segment
-            tool_state = request_info.tool_state
-            tool_calls = []
-            if tool_state is not None:
-                output, tool_calls = tool_state.extract_from_segment(output)
-            if tool_calls:
-                request_info.tool_calls.extend(tool_calls)
-                if request_info.stream:
-                    await request_info.token_queue.put(
-                        {"type": "tool_calls", "tool_calls": tool_calls}
-                    )
-            request_info.weight_version = recv_dict.get("weight_version", None)
-            if "routed_experts" in recv_dict:
-                request_info.routed_experts = recv_dict["routed_experts"]
 
-            # Store probs and token IDs if requested
-            if request_info.return_probs and "probs" in recv_dict:
-                request_info.probs_list.append(recv_dict["probs"])
-                request_info.token_ids_list.append(next_token_id)
-
-            is_finished = (
-                recv_dict.get("eos", False)
-                or recv_dict.get("length", False)
-                or recv_dict.get("abort", False)
-            )
+            is_finished = recv_dict.get("eos", False) or recv_dict.get("length", False)
 
             # Only process and send non-EOS tokens
             if not is_finished and len(output) > 0:
@@ -419,19 +344,12 @@ class HTTPHandler:
 
             # If it is the end of the stream, update status and send sentinel
             if is_finished:
-                if recv_dict.get("abort", False):
-                    logger.warning(f"Request {rid} finished with abort")
-                    request_info.finish_reason = "abort"
-                elif recv_dict.get("length", False):
+                if recv_dict.get("length", False):
                     logger.debug(f"Request {rid} finished with length")
                     request_info.finish_reason = "length"
                 elif recv_dict.get("eos", False):
                     logger.debug(f"Request {rid} finished with eos")
-                    request_info.finish_reason = (
-                        "tool_calls"
-                        if request_info.tool_state and request_info.tool_state.made_tool_call
-                        else "stop"
-                    )
+                    request_info.finish_reason = "eos"
                     request_info.matched_stop = next_token_id
                 else:
                     logger.debug(f"Request {rid} finished with unknown reason")
@@ -622,6 +540,7 @@ def launch_http_server(args):
     Launch function of frontend server.
     It creates a sub-process for the http server.
     """
+    logger.info(f"Start Chat Api server port: {args.port}")
     http_server = ParallaxHttpServer(args)
     process = mp.Process(target=http_server.run)
     process.start()

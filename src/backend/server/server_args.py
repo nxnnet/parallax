@@ -16,8 +16,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--announce-maddrs", nargs="+", default=[], help="List of multiaddresses to announce"
     )
-    parser.add_argument("--tcp-port", type=int, default=0, help="Port for Lattica TCP listening")
-    parser.add_argument("--udp-port", type=int, default=0, help="Port for Lattica UDP listening")
+    parser.add_argument("--tcp-port", type=int, default=55250, help="Port for Lattica TCP listening")
+    parser.add_argument("--udp-port", type=int, default=55250, help="Port for Lattica UDP listening")
     parser.add_argument("--dht-prefix", type=str, default="gradient", help="Prefix for DHT keys")
 
     # Scheduler configuration
@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-level",
         type=str,
-        default="INFO",
+        default="DEBUG",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level",
     )
@@ -40,17 +40,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Use local Hugging Face cache only (no network download)",
-    )
-
-    # Weight refit configuration
-    parser.add_argument(
-        "--enable-weight-refit", type=bool, default=False, help="Enable online weight refit"
-    )
-    parser.add_argument(
-        "--weight-refit-mode",
-        type=str,
-        default="disk",
-        help="Refit mode to choose where. Choices 'cpu' or 'disk'",
     )
 
     args = parser.parse_args()

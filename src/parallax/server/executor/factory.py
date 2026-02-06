@@ -3,7 +3,7 @@ Creates executor from factory for different backends.
 """
 
 import argparse
-from typing import Any, List, Optional
+from typing import Optional
 
 from parallax.utils.utils import get_current_device
 from parallax_utils.logging_config import get_logger, set_log_level
@@ -11,7 +11,7 @@ from parallax_utils.logging_config import get_logger, set_log_level
 logger = get_logger(__name__)
 
 
-def create_executor_config(args: argparse.Namespace, shared_state=None, conn=None):
+def create_executor_config(args: argparse.Namespace, shared_state=None):
     """Create executor configuration from command line arguments."""
 
     config = {
@@ -33,61 +33,38 @@ def create_executor_config(args: argparse.Namespace, shared_state=None, conn=Non
         "executor_input_ipc_addr": args.executor_input_ipc,
         "executor_output_ipc_addr": args.executor_output_ipc,
         "attention_backend": args.attention_backend,
-        "enable_dp_attention": getattr(args, "enable_dp_attention", False),
         "moe_runner_backend": args.moe_runner_backend,
         "tp_rank": args.tp_rank,
         "tp_size": args.tp_size,
-        "dp_rank": getattr(args, "dp_rank", 0),
-        "dp_size": getattr(args, "dp_size", 1),
         "nccl_port": args.nccl_port,
         "shared_state": shared_state,
-        "conn": conn,
         "use_hfcache": args.use_hfcache,
         "enable_lora": args.enable_lora,
         "max_lora_rank": args.max_lora_rank,
+        "lora_target_modules": args.lora_target_modules,
         "lora_paths": args.lora_paths,
         "max_loras_per_batch": args.max_loras_per_batch,
         "max_loaded_loras": args.max_loaded_loras,
-        "enable_weight_refit": args.enable_weight_refit,
-        "weight_refit_mode": args.weight_refit_mode,
+        "lora_eviction_policy": args.lora_eviction_policy,
+        "lora_backend": args.lora_backend,
+        "max_lora_chunk_size": args.max_lora_chunk_size,
     }
-
-    if args.gpu_backend == "sglang":
-        config.update(
-            {
-                "lora_target_modules": args.lora_target_modules,
-                "lora_eviction_policy": args.lora_eviction_policy,
-                "lora_backend": args.lora_backend,
-                "max_lora_chunk_size": args.max_lora_chunk_size,
-            }
-        )
-    elif args.gpu_backend == "vllm":
-        config.update(
-            {
-                "fully_sharded_loras": getattr(args, "fully_sharded_loras", False),
-                "enable_return_routed_experts": getattr(
-                    args, "enable_return_routed_experts", False
-                ),
-            }
-        )
-
     return config
 
 
 def create_from_args(
     args,
     shared_state: Optional[dict] = None,
-    conn: Optional[List[Any]] = None,
     device: Optional[str] = None,
 ):
     """
     Creat executor for different backend.
     Lazy import here since CUDA modules cannot be import withough hardware support.
     """
-    config = create_executor_config(args, shared_state, conn)
+    config = create_executor_config(args, shared_state)
     if device is None:
         device = get_current_device()
-    if device is not None and device.startswith("cuda"):
+    if device == "cuda":
         if args.gpu_backend == "sglang":
             from parallax.server.executor.sglang_executor import SGLExecutor
 
@@ -107,12 +84,12 @@ def create_from_args(
     return executor
 
 
-def run_executor_process(args, shared_state=None, conn=None):
+def run_executor_process(args, shared_state=None):
     """Run executor as a subprocess"""
     set_log_level(args.log_level)
     executor = None
     try:
-        executor = create_from_args(args, shared_state, conn)
+        executor = create_from_args(args, shared_state)
         executor.run_loop()
     except KeyboardInterrupt:
         logger.debug("Executor received interrupt signal, shutting down...")
