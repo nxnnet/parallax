@@ -18,3 +18,4 @@ build/
 help.md
 cli.py.md
 scheduling.md
+*.zip
