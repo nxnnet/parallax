@@ -52,7 +52,7 @@ def _stop_executor_processes(executor_subprocs):
     """Stop all executor processes"""
     for executor_process in executor_subprocs:
         if executor_process.is_alive():
-            logger.debug(f"正在终止 Executor 进程 {executor_process.pid}")
+            logger.debug(f"Terminating executor process {executor_process.pid}")
             stop_executor_process(executor_process)
 
 
@@ -82,14 +82,13 @@ if __name__ == "__main__":
     http_server_process = None
     executor_subprocs = []
     # Shared state for layer allocation info (used when P2P server is in subprocess)
-    # 用于层分配信息的共享状态（当 P2P 服务器在子进程中运行时使用）
     shared_state = SharedState.create()
     shared_state.set_status(ServerState.JOINING.value)
 
     try:
         args = parse_args()
         set_log_level(args.log_level)
-        logger.debug(f"启动参数: {args}")
+        logger.debug(f"args: {args}")
         args.recv_from_peer_addr = f"ipc://{tempfile.NamedTemporaryFile().name}"
         args.send_to_peer_addr = f"ipc://{tempfile.NamedTemporaryFile().name}"
         args.executor_input_ipc = f"ipc://{tempfile.NamedTemporaryFile().name}"
@@ -98,14 +97,12 @@ if __name__ == "__main__":
             args.nccl_port = initialize_nccl_port()
 
         # Silence tokenizer warnings
-        # 禁用 tokenizer 的并行化警告
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
         logger.debug(f"executor_input_addr: {args.executor_input_ipc}")
         logger.debug(f"executor_output_addr: {args.executor_output_ipc}")
         logger.debug(f"nccl_port: {args.nccl_port}")
         if args.scheduler_addr is None:
-            # 本地运行模式（无调度器）
             if args.log_level != "DEBUG":
                 display_parallax_join(args.model_path)
             check_latest_release()
@@ -142,7 +139,6 @@ if __name__ == "__main__":
             )
 
             # Launch all executor processes (including tp_rank=0)
-            # 启动所有 Executor 进程（包括 tp_rank=0）
             for tp_rank in range(args.tp_size):
                 args_copy = argparse.Namespace(**vars(args))
                 args_copy.tp_rank = tp_rank
@@ -160,13 +156,10 @@ if __name__ == "__main__":
             shared_state.set_status(ServerState.READY.value)
 
             # Wait for all executor processes
-            # 等待所有 Executor 进程
             for proc in executor_subprocs:
                 proc.join()
         else:
-            # 分布式模式（加入集群）
             # Launch P2P server as subprocess (with scheduler)
-            # 启动 P2P 服务器作为子进程（连接到调度器）
             # Pass dict to subprocess (multiprocessing requires serializable objects)
             p2p_server_process = launch_p2p_server_process(
                 initial_peers=args.initial_peers,
@@ -195,8 +188,7 @@ if __name__ == "__main__":
             )
 
             # Wait for layer allocation from scheduler (via shared state)
-            # 等待调度器分配层信息（通过共享状态）
-            logger.debug("正在等待调度器分配层信息...")
+            logger.debug("Waiting for layer allocation from scheduler...")
             max_wait_time = 300  # 5 minutes
             wait_start = time.time()
             while True:
@@ -216,8 +208,8 @@ if __name__ == "__main__":
             _update_args_from_shared_state(args, shared_state)
 
             logger.debug(
-                f"启动 Executor，起始层: {args.start_layer}, 结束层: {args.end_layer}, "
-                f"模型: {args.model_path}"
+                f"Start Executor with start_layer: {args.start_layer}, end_layer: {args.end_layer}, "
+                f"model: {args.model_path}"
             )
 
             if args.log_level != "DEBUG":
@@ -229,11 +221,9 @@ if __name__ == "__main__":
             http_server_process = launch_http_server(args)
 
             # Main execution loop with layer reallocation support
-            # 主执行循环，支持层重新分配
             while True:
                 try:
                     # Launch all executor processes (including tp_rank=0)
-                    # 启动所有 Executor 进程（包括 tp_rank=0）
                     executor_subprocs = []
                     for tp_rank in range(args.tp_size):
                         args_copy = argparse.Namespace(**vars(args))
@@ -249,11 +239,9 @@ if __name__ == "__main__":
                         executor_subprocs.append(proc)
 
                     # Wait for executors and restart if layer allocation changes
-                    # 等待 Executor 运行，并检查层分配是否发生变化
                     if _wait_executors_check_layer_change(shared_state, executor_subprocs):
                         logger.warning("Layer allocation changed! Stopping executors to reload...")
                         # Reset flag and set status to INITIALIZING
-                        # 重置标志并将状态设置为 INITIALIZING
                         shared_state.update(
                             _layer_allocation_changed=False,
                             status=ServerState.INITIALIZING.value,
@@ -266,41 +254,36 @@ if __name__ == "__main__":
                         continue
 
                     # All processes exited normally
-                    # 所有进程正常退出
                     break
                 except KeyboardInterrupt:
-                    logger.debug("接收到中断信号，正在关闭...")
+                    logger.debug("Received interrupt signal, shutting down...")
                     break
                 except Exception as e:
                     logger.exception(f"Executor error: {e}")
                     # Shutdown all executor processes on error
-                    # 发生错误时关闭所有 Executor 进程
                     for proc in executor_subprocs:
                         if proc.is_alive():
                             stop_executor_process(proc)
                     raise
     except KeyboardInterrupt:
-        logger.debug("接收到中断信号，正在关闭...")
+        logger.debug("Received interrupt signal, shutting down...")
     except Exception as e:
         logger.exception(e)
     finally:
         # Shutdown all processes
-        logger.debug("正在关闭所有进程...")
+        logger.debug("Shutting down all processes...")
 
         # Shutdown executor subprocesses
-        # 关闭 Executor 子进程
         for executor_process in executor_subprocs:
             if executor_process.is_alive():
                 stop_executor_process(executor_process)
 
         # Shutdown P2P server subprocess
-        # 关闭 P2P 服务器子进程
         if p2p_server_process is not None:
             stop_p2p_server(p2p_server_process)
 
         # Shutdown http server
-        # 关闭 HTTP 服务器
         if http_server_process is not None:
             stop_http_server(http_server_process)
 
-        logger.debug("所有进程已关闭。")
+        logger.debug("All processes shut down.")
