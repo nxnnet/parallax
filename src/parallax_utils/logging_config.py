@@ -37,7 +37,6 @@ _PACKAGE_COLOR = {
     "scheduling": _Ansi.GREEN,
     "backend": _Ansi.YELLOW,
     "sglang": _Ansi.MAGENTA,
-    "vllm": _Ansi.MAGENTA,
 }
 
 
@@ -147,7 +146,7 @@ def _initialize_if_necessary():
         logging.getLogger().setLevel("INFO")
 
         # Allow logs from our main packages by default
-        _enable_default_handler(("parallax", "scheduling", "backend", "sglang", "vllm", "router"))
+        _enable_default_handler(("parallax", "scheduling", "backend", "sglang"))
 
 
 def set_log_level(level_name: str):

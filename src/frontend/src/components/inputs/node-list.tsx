@@ -218,7 +218,6 @@ const Node: FC<{ variant: NodeListVariant; node?: NodeInfo }> = ({ variant, node
             },
           })}
           variant={variant}
-          data-debug-status={status}
         >
           {variant === 'list' && <IconStatus size={18} />}
           {variant === 'menu' && <IconCircleFilled size={10} />}

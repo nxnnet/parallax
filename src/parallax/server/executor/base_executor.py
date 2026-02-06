@@ -64,7 +64,7 @@ class BaseExecutor:
         max_batch_size: Optional[int] = 8,
         max_sequence_length: Optional[int] = None,
         # Controlling perfill / decode ratio
-        max_num_tokens_per_batch: int = 16384,
+        max_num_tokens_per_batch: int = 1024,
         prefill_priority: int = 0,
         micro_batch_ratio: int = 2,
         scheduler_wait_ms: int = 500,
@@ -81,15 +81,8 @@ class BaseExecutor:
         # Tensor Parallel Configs
         tp_rank: Optional[int] = 0,
         tp_size: Optional[int] = 1,
-        dp_rank: Optional[int] = 0,
-        dp_size: Optional[int] = 1,
         # Optional shared state for layer reallocation detection (when running in subprocess)
         shared_state: Optional[dict] = None,
-        # Weight Refit
-        enable_weight_refit: Optional[bool] = False,
-        weight_refit_mode: Optional[str] = "disk",
-        # Pipe communication
-        conn: Optional[List[Any]] = [],
     ):
         # Backend
         if device is not None:
@@ -109,23 +102,10 @@ class BaseExecutor:
         else:
             self.shared_state = None
 
-        # Pipe communication
-        self.conn = conn
-
         self.is_first_peer = start_layer == 0
         self.is_last_peer = end_layer == self.config.get("num_hidden_layers")
         self.tp_size = tp_size
         self.tp_rank = tp_rank
-        self.dp_size = dp_size
-        self.dp_rank = dp_rank
-
-        # Runtime weight refit for RL
-        self.enable_weight_refit = enable_weight_refit
-        self.weight_version = 0
-        self.weight_refit_mode = weight_refit_mode
-        if self.enable_weight_refit and self.tp_size > 1 and self.weight_refit_mode == "cpu":
-            self.weight_refit_mode = "disk"
-            logger.warning(f"Force weight update from disk for TP > 1")
 
         # Metrics throttling for per-layer latency updates
         self.layer_latency_update_every = int(max(1, layer_latency_update_every))
@@ -167,7 +147,7 @@ class BaseExecutor:
             is_first_peer=self.is_first_peer,
             tokenizer=self.tokenizer,
             eos_token_id=self.eos_token_id,
-            cache_manager=self.cache_manager if self.device == "mlx" else None,
+            kv_cache_manager=self.kv_cache_manager if self.device == "mlx" else None,
             request_timeout_s=request_timeout_s,
             shared_state=self.shared_state,
         )
@@ -196,19 +176,6 @@ class BaseExecutor:
                 )
         if self.shared_state is not None:
             self.shared_state.set_status(ServerState.READY.value)
-
-        # store max_sequence_length
-        self.max_sequence_length = max_sequence_length
-        self.model_path = None
-
-        # Log executor ready status
-        logger.info(
-            f"Executor loaded successfully and ready to serve requests "
-            f"(layers [{self.start_layer}, {self.end_layer}), "
-            f"tp_rank={self.tp_rank}/{self.tp_size}, "
-            f"device={self.device}, "
-            f"num_shard_layers={self.num_shard_layers})"
-        )
 
     @abstractmethod
     def handle_input_requests(self, requests: List[Request]):
@@ -244,10 +211,6 @@ class BaseExecutor:
         """
 
     @abstractmethod
-    def check_and_refit_weight(self, refit_weight_path: str):
-        """Run weight if triggered"""
-
-    @abstractmethod
     def _release_request(self, rid: str):
         """Release request in backend frameworks"""
 
@@ -276,19 +239,18 @@ class BaseExecutor:
             except Exception as e:
                 logger.exception(f"Error receiving http request: {e}")
                 self._notify_http_request_error(raw_request, e)
-
         if len(recv_reqs) > 0:
             logger.debug(f"Received {len(recv_reqs)} HTTP requests")
         return recv_reqs
 
-    def recv_requests_from_peer(self) -> Tuple[List[Request], str]:
+    def recv_requests_from_peer(self) -> List[Request]:
         """Receives requests from the RPC server."""
-        refit_weight_path = ""
         if self.tp_rank == 0:
             recv_reqs = []
             while True:
                 try:
                     recv_req = self.recv_from_peer_socket.recv_multipart(zmq.NOBLOCK)
+                    assert len(recv_req) == 2, f"Received invalid request: {recv_req}"
                     if recv_req[0] == b"forward":
                         # Create a new ForwardRequest instance and parse from bytes
                         forward_request = forward_pb2.ForwardRequest()
@@ -303,9 +265,7 @@ class BaseExecutor:
                                         logger.debug(
                                             f"Converting hidden_states dtype from {req.hidden_states.dtype} to {self.dtype} for request {req.request_id}"
                                         )
-                                        if self.device is not None and self.device.startswith(
-                                            "cuda"
-                                        ):
+                                        if self.device == "cuda":
                                             req.hidden_states = req.hidden_states.to(self.dtype)
                                         elif self.device == "mlx":
                                             req.hidden_states = req.hidden_states.astype(self.dtype)
@@ -324,10 +284,6 @@ class BaseExecutor:
                         abort_request.ParseFromString(recv_req[1])
                         recv_req = proto_to_abort_request(abort_request)
                         recv_reqs.extend(recv_req)
-
-                    elif recv_req[0] == b"refit":
-                        refit_weight_path = recv_req[1].decode("ascii")
-                        self.weight_version = int(recv_req[2].decode("ascii"))
                     else:
                         raise ValueError(f"Unknown request type: {recv_req[0]}")
                     # First peer is responsible for tokenization
@@ -345,7 +301,7 @@ class BaseExecutor:
         else:
             recv_reqs = []
 
-        return recv_reqs, refit_weight_path
+        return recv_reqs
 
     def prepare_batch_inputs(self, batched_requests: List[Request]) -> Optional[Dict[str, Any]]:
         """Prepares inputs for ShardedModel from a batch of requests.
@@ -385,59 +341,38 @@ class BaseExecutor:
         }
 
     def prepare_next_batch_requests(
-        self, requests: List[Request], batch_output: Any, context_lengths: Any
+        self, requests: List[Request], hidden_states: Any, context_lengths: Any
     ) -> List[Request]:
-        """Prepares a batch of requests for the next stage of the pipeline.
-
-        Args:
-            requests: List of requests in the batch
-            batch_output: Output from process_batch. Always a dict with:
-                - 'hidden_states': token IDs (last peer) or hidden states tensor (intermediate peer)
-                - 'probs': list of probabilities (last peer) or None (intermediate peer)
-            context_lengths: Context lengths for each request
-        """
-        # Extract hidden_states and probs from output (always a dict now)
-        assert isinstance(
-            batch_output, dict
-        ), f"Expected dict from process_batch, got {type(batch_output)}"
-        hidden_states = batch_output["hidden_states"]
-        token_probs = batch_output["probs"]
-
-        batched_requests = []
-        pre_length = 0
-        for i, src_request in enumerate(requests):
-            if self.is_last_peer:
-                # Last peer gets a 1D array of token IDs
-                hidden_state_for_req = hidden_states[i : i + 1]
-            else:
-                # Other peers get a 3D array of hidden states
-                if src_request.is_prefill:
-                    true_length = int(context_lengths[i])
-                    if hidden_states.ndim == 3:
-                        hidden_state_for_req = hidden_states[i, :true_length, :]
-                    else:
-                        hidden_state_for_req = hidden_states[
-                            pre_length : pre_length + true_length, :
-                        ]
-                    pre_length += true_length
+        """Prepares a batch of requests for the next stage of the pipeline."""
+        if self.tp_rank == 0:
+            batched_requests = []
+            pre_length = 0
+            for i, src_request in enumerate(requests):
+                if self.is_last_peer:
+                    # Last peer gets a 1D array of token IDs
+                    hidden_state_for_req = hidden_states[i : i + 1]
                 else:
-                    if hidden_states.ndim == 3:
-                        hidden_state_for_req = hidden_states[i, :, :]
+                    # Other peers get a 3D array of hidden states
+                    if src_request.is_prefill:
+                        true_length = int(context_lengths[i])
+                        if hidden_states.ndim == 3:
+                            hidden_state_for_req = hidden_states[i, :true_length, :]
+                        else:
+                            hidden_state_for_req = hidden_states[
+                                pre_length : pre_length + true_length, :
+                            ]
+                        pre_length += true_length
                     else:
-                        hidden_state_for_req = hidden_states[pre_length : pre_length + 1, :]
-                    pre_length += 1
+                        if hidden_states.ndim == 3:
+                            hidden_state_for_req = hidden_states[i, :, :]
+                        else:
+                            hidden_state_for_req = hidden_states[pre_length : pre_length + 1, :]
+                        pre_length += 1
 
-            # Get prob for this request if available
-            token_prob = (
-                token_probs[i]
-                if (self.is_last_peer and token_probs and i < len(token_probs))
-                else None
-            )
-
-            next_req = self._prepare_next_single_request(
-                src_request, hidden_state_for_req, token_prob
-            )
-            batched_requests.append(next_req)
+                next_req = self._prepare_next_single_request(src_request, hidden_state_for_req)
+                batched_requests.append(next_req)
+        else:
+            batched_requests = None
 
         return batched_requests
 
@@ -466,14 +401,12 @@ class BaseExecutor:
                 received_requests = self.recv_requests_from_http()
 
             # Receive requests from peer
-            incoming_requests, refit_weight_path = self.recv_requests_from_peer()
-            received_requests.extend(incoming_requests)
-            if self.enable_weight_refit:
-                self.check_and_refit_weight(refit_weight_path)
+            received_requests.extend(self.recv_requests_from_peer())
 
             self.handle_input_requests(received_requests)
-            # Send abort signals to P2P server to broadcast to all nodes
-            if len(self.finished_batch) > 0 and self.tp_rank == 0:
+
+            # Send finished batch to next peer
+            if len(self.finished_batch) > 0 and self.is_first_peer and self.tp_rank == 0:
                 self.send_to_peer_socket.send_multipart(
                     [b"abort", abort_request_to_proto(self.finished_batch).SerializeToString()]
                 )
@@ -549,26 +482,29 @@ class BaseExecutor:
                         # 7. Prepare requests for the next stage in the pipeline
                         next_batch = self.prepare_next_batch_requests(
                             requests=prepared_inputs["requests"],
-                            batch_output=output,
+                            hidden_states=output,
                             context_lengths=prepared_inputs.get("context_lengths"),
                         )
 
                         # 8. Dispatch to the appropriate destination
-                        if self.is_last_peer and self.is_first_peer:
-                            # Single node: handle locally
-                            self.handle_input_requests(next_batch)
-                        elif self.tp_rank == 0:
-                            # Send output to next peer
-                            self.send_to_peer_socket.send_multipart(
-                                [
-                                    b"forward",
-                                    request_to_proto(next_batch, self.device).SerializeToString(),
-                                ]
-                            )
-                            logger.debug(
-                                f"Processed batch of type {batch_type} with {len(next_batch)} requests "
-                                f"in {(time.time() - start_time) * 1000:.3f} ms"
-                            )
+                        if self.tp_rank == 0:
+                            if self.is_last_peer and self.is_first_peer:
+                                # Single node: handle locally
+                                self.handle_input_requests(next_batch)
+                            else:
+                                # Send output to next peer
+                                self.send_to_peer_socket.send_multipart(
+                                    [
+                                        b"forward",
+                                        request_to_proto(
+                                            next_batch, self.device
+                                        ).SerializeToString(),
+                                    ]
+                                )
+                                logger.debug(
+                                    f"Processed batch of type {batch_type} with {len(next_batch)} requests "
+                                    f"in {(time.time() - start_time) * 1000:.3f} ms"
+                                )
 
             except Exception as e:
                 logger.exception(f"Error processing batch: {e}")
@@ -634,31 +570,10 @@ class BaseExecutor:
             prompt = convert_chat(raw_request["messages"], raw_request.get("role_mapping"))
             prompt = self.tokenizer.encode(prompt)
 
-        max_seq_len = self.max_sequence_length if self.max_sequence_length is not None else 4096
-        max_seq_len = max(max_seq_len, 4096)
-        max_new_tokens = raw_request.get("max_tokens", 2048)
-        input_token_num = len(prompt)
-        if input_token_num + max_new_tokens >= max_seq_len:
-            logger.warning(
-                f"Input token length {input_token_num} + max_new_tokens {max_new_tokens} exceeds max_sequence_length {max_seq_len}."
-            )
-            if max_new_tokens > 2048:
-                logger.warning(
-                    f"max_new_tokens {max_new_tokens} is too large, reduce to 2048 tokens."
-                )
-                max_new_tokens = 2048
-            if input_token_num + max_new_tokens >= max_seq_len:
-                logger.warning(
-                    f"Trunc input prompt, keep last {max_seq_len - max_new_tokens} tokens"
-                )
-                prompt = prompt[-(max_seq_len - max_new_tokens) :]
-
+        max_new_tokens = raw_request.get("max_tokens")
+        if max_new_tokens is None:
+            max_new_tokens = 2048
         max_total_length = len(prompt) + max_new_tokens
-        logger.debug(f"Final max_new_tokens for request ID {rid}: {max_new_tokens}")
-        logger.debug(f"Final input token length for request ID {rid}: {len(prompt)}")
-
-        lora_path = raw_request.get("lora_path")
-        return_probs = raw_request.get("return_probs", False)  # Get return_probs parameter
 
         raw_sampling_params = raw_request.get("sampling_params")
         if raw_sampling_params is None:
@@ -682,8 +597,6 @@ class BaseExecutor:
             sampling_params=sampling_params,
             max_new_tokens=max_new_tokens,
             max_total_length=max_total_length,
-            lora_path=lora_path,
-            return_probs=return_probs,
         )
         if "routing_table" in raw_request:
             req.routing_table = raw_request["routing_table"]
@@ -717,9 +630,7 @@ class BaseExecutor:
         except Exception:  # pragma: no cover - best effort notification
             logger.debug("Failed to send error notification to HTTP handler", exc_info=True)
 
-    def _prepare_next_single_request(
-        self, request: Request, hidden_states: Any, token_prob: Optional[float] = None
-    ) -> Request:
+    def _prepare_next_single_request(self, request: Request, hidden_states: Any) -> Request:
         """Handle request state changes both inter and intra peers.
 
         This function prepares the request object to be sent to the *next* peer in the
@@ -728,7 +639,6 @@ class BaseExecutor:
         Args:
             request: The request that was just processed by this peer.
             hidden_states: The output hidden_states/output_ids from the model for this request.
-            token_prob: The probability value for the sampled token (optional).
 
         Returns:
             A new Request object ready to be sent to the next destination.
@@ -748,8 +658,6 @@ class BaseExecutor:
                 hidden_states=hidden_states,
                 next_token_id=next_token_id,
                 routing_table=request.routing_table,
-                lora_path=request.lora_path,
-                token_prob=token_prob,
             )
         if self.is_last_peer:
             # Last peer decodes a token and sends it back to the first peer.
@@ -767,20 +675,14 @@ class BaseExecutor:
                 hidden_states=hidden_states,
                 next_token_id=next_token_id,
                 routing_table=request.routing_table,
-                lora_path=request.lora_path,
-                token_prob=token_prob,
             )
         # This peer is the first or an intermediate peer.
         if self.is_first_peer:
             assert isinstance(request, InitialRequest), "First peer must process an InitialRequest."
             if request.is_finished:
                 hidden_states = None
-            return IntermediateRequest.from_initial_request(
-                request, hidden_states=hidden_states, lora_path=request.lora_path
-            )
+            return IntermediateRequest.from_initial_request(request, hidden_states=hidden_states)
         assert isinstance(
             request, IntermediateRequest
         ), "Intermediate peer must process an IntermediateRequest."
-        return IntermediateRequest.from_intermediate_request(
-            request, hidden_states, lora_path=request.lora_path
-        )
+        return IntermediateRequest.from_intermediate_request(request, hidden_states)
