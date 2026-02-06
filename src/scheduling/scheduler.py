@@ -1,5 +1,6 @@
 """
 Scheduler for Layer Allocation and Request Routing.
+负责层分配(Layer Allocation)和请求路由(Request Routing)的调度器。
 """
 
 from __future__ import annotations
@@ -26,7 +27,14 @@ logger = get_logger(__name__)
 
 
 class Scheduler:
-    """Coordinates allocation, node materialization, and request routing."""
+    """Coordinates allocation, node materialization, and request routing.
+    协调层分配、节点具体化和请求路由的核心类。
+    主要职责：
+    1. 管理节点生命周期（加入、离开、更新）。
+    2. 使用分配器（LayerAllocator）将模型层分配给节点。
+    3. 使用路由器（RequestRouter）为每个请求规划最佳路径。
+    4. 监控节点健康状态（心跳检测）。
+    """
 
     def __init__(
         self,
@@ -43,23 +51,24 @@ class Scheduler:
         heartbeat_timeout: float = 60.0,
     ) -> None:
         """Initialize the scheduler.
+        初始化调度器。
 
         Args:
-            model_info: Model architecture information used by allocators and routers.
-            nodes: Initial list of candidate nodes.
-            min_nodes_bootstrapping: Minimum nodes required to attempt initial allocation.
-            strategy: Layer allocation strategy ("dp" or "greedy").
-            routing_strategy: Request routing strategy ("dp" for dynamic programming, or
-                "greedy" for round-robin over complete pipelines skipping overloaded ones).
-            request_arrival_horizon_sec: Sliding window horizon for arrival-rate tracking.
-            rebalance_threshold: Threshold for triggering rebalancing in allocation.
-            water_filling_max_iterations: Max iterations for water-filling allocation.
-            request_warm_up_for_reshard: Number of warm-up requests to detect truncation.
-            heartbeat_timeout: Time in seconds to consider node heartbeat stale.
+            model_info: 模型架构信息，供分配器和路由器使用。
+            nodes: 初始候选节点列表。
+            min_nodes_bootstrapping: 尝试初始分配所需的最少节点数。
+            strategy: 层分配策略（动态规划(dp)或贪婪算法(greedy)）。
+            routing_strategy: 请求路由策略（"dp" 为动态规划，"greedy" 为轮询完整流水线并跳过过载节点）。
+            request_arrival_horizon_sec: 跟踪到达率的滑动窗口时间范围（秒）。
+            rebalance_threshold: 触发重新平衡分配的阈值。
+            water_filling_max_iterations: 注水算法分配的最大迭代次数。
+            request_warm_up_for_reshard: 用于检测截断点的预热请求数量。
+            heartbeat_timeout: 判定节点心跳过期的超时时间（秒）。
         """
         self.model_info = model_info
         self.num_layers = model_info.num_layers
 
+        # 选择层分配策略：贪婪或动态规划
         allocator_class = (
             GreedyLayerAllocator if strategy == "greedy" else DynamicProgrammingLayerAllocator
         )
@@ -69,11 +78,13 @@ class Scheduler:
             rebalance_threshold=rebalance_threshold,
             water_filling_max_iterations=water_filling_max_iterations,
         )
-        # Ensure Scheduler and allocator share the same node list to avoid divergence.
+
+        # 确保调度器和分配器共享同一个节点列表，避免状态不一致
         self.nodes = self.layer_allocator.nodes
         self.node_id_to_node: Dict[str, Node] = self.layer_allocator.node_id_to_node
         self.min_nodes_bootstrapping = min_nodes_bootstrapping
 
+        # 选择请求路由策略：动态规划或轮询
         self.request_router = (
             DynamicProgrammingRouting() if routing_strategy == "dp" else RoundRobinPipelineRouting()
         )
@@ -84,19 +95,22 @@ class Scheduler:
         self.heartbeat_timeout = heartbeat_timeout
         self._arrival_ts: Deque[float] = deque()
 
-        # Event queues for main loop orchestration (thread-safe)
+
+        # 用于主循环编排的事件队列（线程安全）
         self._pending_joins: "queue.Queue[Node]" = queue.Queue()
         self._pending_leaves: "queue.Queue[str]" = queue.Queue()
         self._pending_node_updates: "queue.Queue[Tuple[str, Optional[int], Optional[float], Optional[Dict[str, float]], Optional[bool]]]" = (queue.Queue())
 
-        # Concurrency controls
+
+        # 并发控制工具
         self._stop_event: threading.Event = threading.Event()
         self._wake_event: threading.Event = threading.Event()
         self._node_count_cv: threading.Condition = threading.Condition()
         self._event_thread: Optional[threading.Thread] = None
         self._dispatch_thread: Optional[threading.Thread] = None
         self._alloc_log_thread: Optional[threading.Thread] = None
-        # Thread-safe bootstrap state
+
+        # 线程安全的引导状态
         self._bootstrapped: bool = False
         self._bootstrapped_event: threading.Event = threading.Event()
         logger.debug(
@@ -105,7 +119,8 @@ class Scheduler:
         )
         self._node_assigned_request_count: Dict[str, int] = {}
 
-        # Eager bootstrap for initial allocation if enough nodes are present
+
+        # 如果有足够的节点，立即尝试进行初始分配（急切引导）
         try:
             if len(self.nodes) >= self.min_nodes_bootstrapping:
                 logger.debug(
@@ -115,30 +130,31 @@ class Scheduler:
         except Exception:  # best-effort eager allocation
             pass
 
-    # Orchestration helpers
+
+    # 编排辅助方法
     def bootstrap(self, *, clear_existing: bool = False, skip_warmup: bool = False) -> bool:
-        """Bootstrapping:
-        This method can be used for both initial bootstrapping and global rebalancing.
-        When clear_existing=True, it first deallocates all existing allocations before
-        performing global allocation (rebalancing behavior). When clear_existing=False,
-        it performs allocation on top of existing state (initial bootstrapping behavior).
+        """引导过程：
+        此方法可用于初始引导和全局重新平衡。
+        当 clear_existing=True 时，它会在执行全局分配之前先取消所有现有分配（重新平衡行为）。
+        当 clear_existing=False 时，它在现有状态之上执行分配（初始引导行为）。
 
         Args:
-            clear_existing: If True, deallocate all existing allocations before reallocating.
-                This is used for global rebalancing. Default is False.
-            skip_warmup: If True, skip the warm-up and truncate step. Default is False.
+            clear_existing: 如果为 True，则在重新分配前清除所有现有分配。用于全局重新平衡。默认为 False。
+            skip_warmup: 如果为 True，则跳过预热和截断步骤。默认为 False。
 
         Returns:
-            True if a full pipeline was established; False otherwise.
+            如果成功建立完整的流水线，则返回 True；否则返回 False。
         """
-        # Check node count only for initial bootstrapping (not rebalancing)
+
+        # 仅在初始引导时检查节点数量（重新平衡时不检查）
         if not clear_existing and len(self.nodes) < self.min_nodes_bootstrapping:
             logger.debug(
                 f"Bootstrapping deferred: have {len(self.nodes)} nodes; need >= {self.min_nodes_bootstrapping}"
             )
             return False
 
-        # Clear existing allocations if this is a rebalance
+
+        # 如果是重新平衡，则清除现有分配
         if clear_existing:
             logger.debug("Performing global rebalance (clearing existing allocations)")
             self._bootstrapped = False
@@ -149,7 +165,8 @@ class Scheduler:
         else:
             logger.debug("Bootstrapping layer allocator")
 
-        # Perform global allocation
+  
+        # 执行全局分配
         success = self.layer_allocator.global_allocation()
         if not success:
             logger.warning("Global allocation failed to produce a full pipeline")
@@ -158,8 +175,9 @@ class Scheduler:
         assignments = self.list_node_allocations()
         logger.debug(f"Layer allocator assignments: {assignments}")
 
-        # Optional warm-up to find turning points and truncate node ranges
-        # Skip warmup for rebalancing scenarios (can be overridden with skip_warmup=False)
+
+        # 可选的预热步骤，用于查找转折点并截断节点范围
+        # 重新平衡场景跳过预热（可以通过 skip_warmup=False 覆盖）
         if not skip_warmup and self.request_warm_up_for_reshard > 0:
             self._run_warmup_and_truncate()
             assignments = self.list_node_allocations()
@@ -176,20 +194,29 @@ class Scheduler:
         return True
 
     def list_node_allocations(self) -> List[Tuple[str, int, int]]:
-        """List the allocations of all nodes."""
+        """List the allocations of all nodes.
+        列出所有节点的分配情况。
+        """
         return self.layer_allocator.list_node_allocations()
 
-    # Warm-up and re-shard
+
+    # 预热和重新分片
     def _run_warmup_and_truncate(self, override_warmup_count: int = 0) -> None:
         """Run a brief warm-up to detect truncation points and shrink shards.
+        运行简短的预热以检测截断点并收缩分片。
 
         Uses layer-level DP turning points (node_id, layer_idx, kind):
         - kind == "tail": drop [layer_idx, end) on that node
         - kind == "head": drop [start, layer_idx) on that node
+        使用层级动态规划转折点（node_id, layer_idx, kind）：
+        - kind == "tail": 在该节点上丢弃 [layer_idx, end)
+        - kind == "head": 在该节点上丢弃 [start, layer_idx)
 
         Note: Always uses DynamicProgrammingRouting for finding turning points,
         regardless of the current request_router type, since turning points
         detection requires layer-level DP analysis.
+        注意：始终使用 DynamicProgrammingRouting 查找转折点，无论当前的 request_router 类型如何，
+        因为转折点检测需要层级 DP 分析。
 
         Args:
             override_warmup_count: If > 0, use this value instead of request_warm_up_for_reshard.
@@ -200,8 +227,8 @@ class Scheduler:
             return
         num_layers = self.model_info.num_layers
 
-        # The number of warm-up requests can be used to repeat detection, but a
-        # single pass is sufficient with our DP model; we repeat to smooth noise.
+
+        # 预热请求的数量可用于重复检测，但对于我们的 DP 模型，单次通过已足够；我们重复以平滑噪声。
         warmup_count = (
             override_warmup_count if override_warmup_count > 0 else self.request_warm_up_for_reshard
         )
@@ -212,9 +239,9 @@ class Scheduler:
             for t in turns:
                 agg_turns[t] = agg_turns.get(t, 0) + 1
 
-        # Apply truncation for consistently observed turning points
-        # Note: Must use layer_allocator.allocate/deallocate to properly update
-        # internal state (node_allocation dict and layer_to_load)
+
+        # 对一致观察到的转折点应用截断
+        # 注意：必须使用 layer_allocator.allocate/deallocate 以正确更新内部状态（node_allocation 字典和 layer_to_load）
         for node_id, layer_idx, kind in agg_turns:
             node = next((n for n in self.nodes if n.node_id == node_id), None)
             if node is None or node.start_layer is None or node.end_layer is None:
@@ -236,7 +263,9 @@ class Scheduler:
         new_rtt_to_nodes: Optional[Dict[str, float]] = None,
         is_active: Optional[bool] = None,
     ) -> None:
-        """Update the info of a node."""
+        """更新节点信息。
+        包括：当前请求数、层延迟、与其他节点的 RTT、活跃状态等。
+        """
         if current_requests is not None:
             node.current_requests = current_requests
         if layer_latency_ms is not None:
@@ -255,14 +284,17 @@ class Scheduler:
         # )
 
     # Async-style event enqueuers for main loop
+    # 用于主循环的异步风格事件入队器
     def enqueue_join(self, node: Node) -> None:
-        """Enqueue a join event."""
+        """加入事件入队。
+        """
         logger.debug(f"Enqueueing join event for node {node.node_id}")
         self._pending_joins.put(node)
         self._wake_event.set()
 
     def enqueue_leave(self, node_id: str) -> None:
-        """Enqueue a leave event."""
+        """离开事件入队。
+        """
         self._pending_leaves.put(node_id)
         self._wake_event.set()
 
@@ -275,14 +307,17 @@ class Scheduler:
         new_rtt_to_nodes: Optional[Dict[str, float]] = None,
         is_active: Optional[bool] = None,
     ) -> None:
-        """Enqueue a node update event."""
+        """节点更新事件入队。
+        """
         self._pending_node_updates.put(
             (node_id, current_requests, layer_latency_ms, new_rtt_to_nodes, is_active)
         )
         self._wake_event.set()
 
     def checking_node_heartbeat(self) -> None:
-        """Check the heartbeat of all nodes."""
+        """检查所有节点的心跳。
+        如果节点超时，则强制其离开。
+        """
         for node in self.nodes:
             if not node.is_active:
                 continue
@@ -291,8 +326,10 @@ class Scheduler:
                 self.leave(node.node_id)
 
     # Dynamic node management
+    # 动态节点管理
     def join(self, node: Node, bootstrap: bool = False) -> None:
-        """Add a node to allocation and refresh plan and materialized nodes."""
+        """添加一个节点到分配中，并刷新计划和已具体化的节点。
+        """
         logger.debug(
             "Joining node %s (kv_ratio=%.2f, param_ratio=%.2f, manual_assignment=%s)",
             node.node_id,
@@ -302,9 +339,10 @@ class Scheduler:
         )
         self.layer_allocator.declare(node)
 
-        # Manual layer assignment bypasses bootstrap waiting
+        # 手动层分配跳过引导等待
         if node.manual_layer_assignment:
-            # Manual layer assignment: use the layers specified by the node
+
+            # 手动层分配：使用节点指定的层
             if node.start_layer is None or node.end_layer is None:
                 raise ValueError(
                     f"Node {node.node_id} has manual_layer_assignment=True "
@@ -314,10 +352,11 @@ class Scheduler:
                 f"Manual layer assignment for node {node.node_id}: "
                 f"layers [{node.start_layer}, {node.end_layer})"
             )
-            # Directly allocate the specified layers without automatic assignment
+
+            # 直接分配指定的层，无需自动分配
             self.layer_allocator.allocate(node, node.start_layer, node.end_layer)
 
-            # Check if manual allocations now cover the full pipeline
+            # 检查手动分配是否已覆盖完整的流水线
             if self.layer_allocator.has_full_pipeline():
                 if not self._bootstrapped:
                     logger.info(
@@ -327,16 +366,18 @@ class Scheduler:
                     self._bootstrapped = True
                     self._bootstrapped_event.set()
         elif not bootstrap:
-            # Automatic layer assignment (only after bootstrap)
+            # 自动层分配（仅在引导后）
             self.layer_allocator.join(node)
-        # If bootstrap=True and not manual, node is only declared (allocation deferred to bootstrap())
 
-        # Notify waiters that node count changed
+        # 如果 bootstrap=True 且非手动，节点仅被声明（分配推迟到 bootstrap()）
+
+        # 通知等待者节点数量已更改
         with self._node_count_cv:
             self._node_count_cv.notify_all()
 
     def leave(self, node_id: str) -> None:
-        """Remove a node from allocation and refresh plan and materialized nodes."""
+        """从分配中移除一个节点，并刷新计划和已具体化的节点。
+        """
         if node_id not in self.layer_allocator.node_id_to_node:
             raise ValueError(f"Node {node_id} not found in nodes")
         node = self.node_id_to_node[node_id]
@@ -347,7 +388,7 @@ class Scheduler:
         if self.layer_allocator.should_global_rebalance():
             logger.debug("Global rebalance triggered due to node leave")
 
-            # Count manual vs automatic nodes
+            # 统计手动与自动节点
             manual_count = sum(1 for n in self.nodes if n.manual_layer_assignment)
             total_count = len(self.nodes)
             logger.debug(
@@ -360,7 +401,7 @@ class Scheduler:
                     f"Mixed assignment detected ({manual_count} manual, {total_count - manual_count} automatic); skipping rebalance"
                 )
             else:
-                # All nodes are automatic, try adjustment first, then rebalance if needed
+                # 所有节点均为自动，先尝试调整，如有需要再重新平衡
                 if not self.layer_allocator.has_full_pipeline():
                     logger.debug(
                         "No full pipeline after node leave, attempting warmup and truncate"
@@ -379,7 +420,8 @@ class Scheduler:
             self._node_count_cv.notify_all()
 
     def receive_request(self, request: RequestSignal) -> None:
-        """Add a request to the wait pool."""
+        """将请求添加到等待池中。
+        """
         self._request_queue.put(request)
         self._wake_event.set()
         now = time.time()
@@ -387,22 +429,24 @@ class Scheduler:
         logger.debug(
             "Received request %s (queue_size=%d)", request.request_id, self._request_queue.qsize()
         )
-        # Trim old timestamps to keep arrival-rate window bounded
+        # 修剪旧时间戳以保持到达率窗口有界
         horizon = self.request_arrival_horizon_sec
         while self._arrival_ts and now - self._arrival_ts[0] > horizon:
             self._arrival_ts.popleft()
 
     def dispatch_next_request(self) -> Optional[Tuple[str, List[str], float]]:
-        """Route the next request in the wait pool; returns (request_id, path, latency)."""
+        """路由等待池中的下一个请求；返回 (request_id, path, latency)。
+        """
         try:
             req = self._request_queue.get_nowait()
         except queue.Empty:
             req = None
         if req is None:
             return None
+        # 使用请求路由器查找最佳路径
         path, latency = self.request_router.find_optimal_path(self.nodes, self.num_layers)
         req.routing_table = path
-        # Update simple load counters
+        # 更新简单的负载计数器
         for node_id in path:
             n = self.node_id_to_node[node_id]
             if n is not None:
@@ -416,26 +460,24 @@ class Scheduler:
         return req.request_id, path, latency
 
     def run(self, *, poll_interval: float = 0.05, allocation_log_interval: float = 5.0) -> None:
-        """Run the scheduler concurrently until `stop()` is called.
-
-        Starts background threads for event processing (joins/leaves/updates/heartbeats)
-        and request dispatching. At startup, waits until at least
-        `min_nodes_bootstrapping` nodes are present, then runs `bootstrap()`.
+        """ 并发运行调度器，直到调用 `stop()`。
+        启动后台线程进行事件处理（joins/leaves/updates/heartbeats）和请求分发。
+        启动时，等待至少 `min_nodes_bootstrapping` 个节点出现，然后运行 `bootstrap()`。
         """
         logger.debug("Running scheduler")
         self._stop_event.clear()
 
-        # Start event thread first so joins can be processed while we wait to bootstrap
+        # 首先启动事件线程，以便在等待引导时处理加入事件
         self._event_thread = threading.Thread(
             target=self._event_loop, args=(poll_interval,), name="SchedulerEventLoop", daemon=True
         )
         self._event_thread.start()
 
-        # Bootstrap gating
+        # 引导门控：等待足够的节点
         if not self._wait_for_bootstrap(poll_interval):
             return
 
-        # Start dispatcher only after successful bootstrap
+        # 仅在成功引导后启动分发器
         self._dispatch_thread = threading.Thread(
             target=self._dispatch_loop,
             args=(poll_interval,),
@@ -444,9 +486,10 @@ class Scheduler:
         )
         self._dispatch_thread.start()
 
-        # Start periodic allocation logger thread
+        # 启动定期分配日志记录线程
         def _alloc_log_loop() -> None:
-            """Periodically log current layer allocations."""
+            """定期记录当前层分配情况。
+            """
             while not self._stop_event.is_set():
                 try:
                     assignments = self.list_node_allocations()
@@ -482,7 +525,7 @@ class Scheduler:
         )
         self._alloc_log_thread.start()
 
-        # Block until stop is requested
+        # 阻塞直到请求停止
         try:
             while not self._stop_event.is_set():
                 time.sleep(max(0.5, poll_interval))
@@ -494,9 +537,11 @@ class Scheduler:
             if self._alloc_log_thread is not None:
                 self._alloc_log_thread.join(timeout=2.0)
 
-    # === Modularized worker loops ===
+    # === 模块化工作循环 ===
     def _event_loop(self, poll_interval: float) -> None:
-        """Process joins/leaves/updates and perform heartbeat checks."""
+        """Process joins/leaves/updates and perform heartbeat checks.
+        处理加入/离开/更新并执行心跳检查。
+        """
         last_hb_check = 0.0
         while not self._stop_event.is_set():
             self._process_node_updates()
@@ -510,7 +555,8 @@ class Scheduler:
             self._wake_event.clear()
 
     def _dispatch_loop(self, poll_interval: float) -> None:
-        """Continuously dispatch incoming requests while running."""
+        """运行时持续分发传入请求。
+        """
         while not self._stop_event.is_set():
             try:
                 req = self._request_queue.get(timeout=poll_interval)
@@ -533,7 +579,8 @@ class Scheduler:
                 continue
 
     def _wait_for_bootstrap(self, poll_interval: float) -> bool:
-        """Wait until enough nodes then run bootstrap. Returns False if stopped."""
+        """等待直到有足够的节点，然后运行引导。如果停止则返回 False。
+        """
         logger.debug("Waiting for bootstrap")
         while not self._stop_event.is_set() and not self._bootstrapped_event.is_set():
             with self._node_count_cv:
@@ -548,7 +595,8 @@ class Scheduler:
         return not self._stop_event.is_set()
 
     def _process_node_updates(self) -> None:
-        """Apply pending node stats updates from the queue."""
+        """从队列应用挂起的节点统计信息更新。
+        """
         while True:
             try:
                 node_id, cur, lat, rtts, is_active = self._pending_node_updates.get_nowait()
@@ -566,7 +614,8 @@ class Scheduler:
             )
 
     def _process_joins(self) -> None:
-        """Handle pending join events, honoring bootstrap state for assignment."""
+        """处理挂起的加入事件，遵循分配的引导状态。
+        """
         joined_any = False
         had_manual_assignment = False
         while True:
@@ -574,19 +623,18 @@ class Scheduler:
                 node = self._pending_joins.get_nowait()
             except queue.Empty:
                 break
-            # During bootstrap (no full pipeline yet), only declare nodes; no dynamic assignment.
-            # After bootstrap, allow dynamic light-weight joins.
-            # Exception: manual layer assignments are processed immediately regardless of bootstrap state.
+            # 在引导期间（尚未建立完整流水线），仅声明节点；不进行动态分配。
+            # 引导后，允许动态轻量级加入。
+            # 例外：手动层分配无论引导状态如何都会立即处理。
             self.join(node, bootstrap=not self._bootstrapped_event.is_set())
             joined_any = True
             if node.manual_layer_assignment:
                 had_manual_assignment = True
 
-        # If we are not bootstrapped (e.g., after a leave-triggered rebalance) and
-        # new nodes just joined, attempt a greedy bootstrap immediately when we have
-        # enough nodes. If it doesn't produce a full pipeline, we'll try again on
-        # subsequent joins.
-        # Skip bootstrap if manual assignments were used (they handle bootstrapping internally).
+        # 如果尚未引导（例如，在离开触发的重新平衡之后）且新节点刚刚加入，
+        # 当我们有足够的节点时，立即尝试贪婪引导。
+        # 如果未能产生完整的流水线，我们将在后续加入时重试。
+        # 如果使用了手动分配，则跳过引导（它们在内部处理引导）。
         if joined_any and not self._bootstrapped_event.is_set() and not had_manual_assignment:
             if len(self.nodes) >= self.min_nodes_bootstrapping:
                 try:
@@ -607,7 +655,8 @@ class Scheduler:
                 )
 
     def _process_leaves(self) -> None:
-        """Handle pending leave events safely."""
+        """安全地处理挂起的离开事件。
+        """
         while True:
             try:
                 node_id = self._pending_leaves.get_nowait()
@@ -619,7 +668,8 @@ class Scheduler:
                 logger.warning(f"Leave failed for {node_id}: {exc}")
 
     def stop(self) -> None:
-        """Signal background threads to stop and wake any waiters."""
+        """向后台线程发送停止信号并唤醒任何等待者。
+        """
         self._stop_event.set()
         self._wake_event.set()
         with self._node_count_cv:

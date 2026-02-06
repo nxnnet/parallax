@@ -540,6 +540,7 @@ def launch_http_server(args):
     Launch function of frontend server.
     It creates a sub-process for the http server.
     """
+    logger.info(f"Start Chat Api server port: {args.port}")
     http_server = ParallaxHttpServer(args)
     process = mp.Process(target=http_server.run)
     process.start()
