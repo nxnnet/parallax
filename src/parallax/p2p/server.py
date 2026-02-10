@@ -213,7 +213,6 @@ class GradientServer:
         max_sequence_length: Optional[int] = None,
         param_mem_ratio: float = 0.65,
         kvcache_mem_ratio: float = 0.25,
-        key_path: str = ".",
     ):
         self.recv_from_peer_addr = recv_from_peer_addr
         self.send_to_peer_addr = send_to_peer_addr
@@ -234,7 +233,6 @@ class GradientServer:
         self.max_sequence_length = max_sequence_length
         self.param_mem_ratio = param_mem_ratio
         self.kvcache_mem_ratio = kvcache_mem_ratio
-        self.key_path = key_path
         self.prefix_id = f"{dht_prefix}_announce"
         self.lattica = None
         self.routing_table = None
@@ -270,7 +268,7 @@ class GradientServer:
             )
 
     def build_lattica(self):
-        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs).with_key_path(self.key_path)
+        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs)
 
         if self.scheduler_addr is not None and self.scheduler_addr != "auto":
             if self.scheduler_addr.startswith("/"):
@@ -796,7 +794,6 @@ def _run_p2p_server_process(
     kvcache_mem_ratio: float = 0.25,
     shared_state: Optional[dict] = None,
     log_level: str = "INFO",
-    key_path: str = ".",
 ):
     """Run P2P server in subprocess"""
     # Set log level in subprocess (spawn mode doesn't inherit log configuration)
@@ -826,7 +823,6 @@ def _run_p2p_server_process(
             max_sequence_length=max_sequence_length,
             param_mem_ratio=param_mem_ratio,
             kvcache_mem_ratio=kvcache_mem_ratio,
-            key_path=key_path,
         )
         # Attach shared state to server for syncing layer allocation
         if shared_state is not None:
@@ -874,7 +870,6 @@ def launch_p2p_server_process(
     kvcache_mem_ratio: float = 0.25,
     shared_state: Optional[dict] = None,
     log_level: str = "INFO",
-    key_path: str = ".",
 ) -> multiprocessing.Process:
     """Launch P2P server as a subprocess and return the process object
 
@@ -908,13 +903,12 @@ def launch_p2p_server_process(
             kvcache_mem_ratio,
             shared_state,
             log_level,
-            key_path,
         ),
     )
     process.start()
     return process
 
-
+ 
 def stop_p2p_server(p2p_server_process: Optional[multiprocessing.Process]):
     """Stop P2P server subprocess"""
     if p2p_server_process is not None and p2p_server_process.is_alive():
