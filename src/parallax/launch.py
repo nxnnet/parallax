@@ -184,7 +184,6 @@ if __name__ == "__main__":
                 kvcache_mem_ratio=args.kvcache_mem_ratio,
                 shared_state=shared_state.dict,  # Pass dict to subprocess
                 log_level=args.log_level,
-                key_path=args.key_path,
             )
 
             # Wait for layer allocation from scheduler (via shared state)
