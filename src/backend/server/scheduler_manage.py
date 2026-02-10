@@ -33,7 +33,6 @@ class SchedulerManage:
         announce_maddrs: List[str] = [],
         http_port: int = 3001,
         use_hfcache: bool = False,
-        key_path: str = ".",
     ):
         """Initialize the manager with networking bootstrap parameters."""
         self.initial_peers = initial_peers
@@ -43,7 +42,6 @@ class SchedulerManage:
         self.announce_maddrs = announce_maddrs
         self.http_port = http_port
         self.use_hfcache = use_hfcache
-        self.key_path = key_path
         self.model_name = None
         self.init_nodes_num = None
         self.scheduler = None
@@ -202,7 +200,7 @@ class SchedulerManage:
         logger.debug(
             f"Starting Lattica with host_maddrs={self.host_maddrs}, mdns=False, dht_prefix={self.dht_prefix}"
         )
-        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs).with_key_path(self.key_path)
+        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs).with_key_path(".")
 
         if len(self.relay_servers) > 0:
             logger.info(f"Using relay servers: {self.relay_servers}")
