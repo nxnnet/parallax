@@ -36,8 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-peers", nargs="+", default=[], help="List of initial DHT peers")
     parser.add_argument("--scheduler-addr", type=str, default=None, help="Scheduler address")
     parser.add_argument("--relay-servers", nargs="+", default=[], help="List of relay DHT peers")
-    parser.add_argument("--tcp-port", type=int, default=0, help="Port for Lattica TCP listening")
-    parser.add_argument("--udp-port", type=int, default=0, help="Port for Lattica UDP listening")
+    parser.add_argument("--tcp-port", type=int, default=55250, help="Port for Lattica TCP listening")
+    parser.add_argument("--udp-port", type=int, default=55250, help="Port for Lattica UDP listening")
     parser.add_argument(
         "--announce-maddrs", nargs="+", default=[], help="List of multiaddresses to announce"
     )
